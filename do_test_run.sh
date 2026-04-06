@@ -4,7 +4,7 @@
 set -e
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-DOCKER_IMAGE_TAG="example-algorithm-preliminary-phase"
+DOCKER_IMAGE_TAG="fm2s-algorithm-phase-1"
 DOCKER_NOOP_VOLUME="${DOCKER_IMAGE_TAG}-volume"
 
 INPUT_DIR="${SCRIPT_DIR}/test/input"

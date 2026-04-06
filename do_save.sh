@@ -6,7 +6,7 @@ set -e
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 # Set default container name
-DOCKER_IMAGE_TAG="example-algorithm-preliminary-phase"
+DOCKER_IMAGE_TAG="fm2s-algorithm-phase-1"
 
 echo "=+= (Re)build the container"
 source "${SCRIPT_DIR}/do_build.sh"
@@ -37,12 +37,12 @@ echo "Container image saved as ${output_filename}"
 echo "==+=="
 
 # Create the tarbal
-echo "==+=="
-output_tarball_name="${SCRIPT_DIR}/nmodel.tar.gz"
-echo "Creating the optional tarball as ${output_tarball_name}. This can take a while."
-
-echo ""
-
-tar -czf $output_tarball_name -C "${SCRIPT_DIR}/model" .
-echo "(Optional) Uploadable tarball was created as ${output_tarball_name}"
-echo "==+=="
+#echo "==+=="
+#output_tarball_name="${SCRIPT_DIR}/nmodel.tar.gz"
+#echo "Creating the optional tarball as ${output_tarball_name}. This can take a while."
+#
+#echo ""
+#
+#tar -czf $output_tarball_name -C "${SCRIPT_DIR}/model" .
+#echo "(Optional) Uploadable tarball was created as ${output_tarball_name}"
+#echo "==+=="
