@@ -2,7 +2,91 @@
     {
         "file": null,
         "image": {
-            "name": "the_original_filename_of_the_file_that_was_uploaded.suffix"
+            "name": "A1.tif"
+        },
+        "value": null,
+        "interface": {
+            "slug": "stacked-neuron-images-with-noise",
+            "kind": "Image",
+            "super_kind": "Image",
+            "relative_path": "images/stacked-neuron-images-with-noise",
+            "example_value": null
+        }
+    },
+    {
+        "file": null,
+        "image": {
+            "name": "B1.tif"
+        },
+        "value": null,
+        "interface": {
+            "slug": "stacked-neuron-images-with-noise",
+            "kind": "Image",
+            "super_kind": "Image",
+            "relative_path": "images/stacked-neuron-images-with-noise",
+            "example_value": null
+        }
+    },
+    {
+        "file": null,
+        "image": {
+            "name": "C1.tif"
+        },
+        "value": null,
+        "interface": {
+            "slug": "stacked-neuron-images-with-noise",
+            "kind": "Image",
+            "super_kind": "Image",
+            "relative_path": "images/stacked-neuron-images-with-noise",
+            "example_value": null
+        }
+    },
+    {
+        "file": null,
+        "image": {
+            "name": "D1.tif"
+        },
+        "value": null,
+        "interface": {
+            "slug": "stacked-neuron-images-with-noise",
+            "kind": "Image",
+            "super_kind": "Image",
+            "relative_path": "images/stacked-neuron-images-with-noise",
+            "example_value": null
+        }
+    },
+    {
+        "file": null,
+        "image": {
+            "name": "F1.tif"
+        },
+        "value": null,
+        "interface": {
+            "slug": "stacked-neuron-images-with-noise",
+            "kind": "Image",
+            "super_kind": "Image",
+            "relative_path": "images/stacked-neuron-images-with-noise",
+            "example_value": null
+        }
+    },
+    {
+        "file": null,
+        "image": {
+            "name": "F2.tif"
+        },
+        "value": null,
+        "interface": {
+            "slug": "stacked-neuron-images-with-noise",
+            "kind": "Image",
+            "super_kind": "Image",
+            "relative_path": "images/stacked-neuron-images-with-noise",
+            "example_value": null
+        }
+    },
+    {
+        "file": null,
+        "image": {
+            "name": "F3.tif"
         },
         "value": null,
         "interface": {
