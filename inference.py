@@ -27,10 +27,10 @@ from fm2s import (
     fm2s_denoise_stack,
 )
 
-# INPUT_PATH = Path("/input")
-# OUTPUT_PATH = Path("/output")
-INPUT_PATH = Path("/home/aagamsheth/Documents/Education/Ahmedabad University/MTECH CSE 2025 - 2027/SEM 2/CSE 602/Project/AI4Life-CIDC25/test/input/interf0")
-OUTPUT_PATH = Path("/home/aagamsheth/Documents/Education/Ahmedabad University/MTECH CSE 2025 - 2027/SEM 2/CSE 602/Project/AI4Life-CIDC25/test/output/interf0")
+INPUT_PATH = Path("/input")
+OUTPUT_PATH = Path("/output")
+#INPUT_PATH = Path("/home/aagamsheth/Documents/Education/Ahmedabad University/MTECH CSE 2025 - 2027/SEM 2/CSE 602/Project/AI4Life-CIDC25/test/input/interf0")
+#OUTPUT_PATH = Path("/home/aagamsheth/Documents/Education/Ahmedabad University/MTECH CSE 2025 - 2027/SEM 2/CSE 602/Project/AI4Life-CIDC25/test/output/interf0")
 
 
 def run():
@@ -56,68 +56,74 @@ def interf0_handler():
     print("\n[1/4] Loading input stack...")
     t_total = time.time()
 
-    input_stack = load_image_file_as_array(
+    input_stack_array = load_image_file_as_array(
         location=INPUT_PATH / "images/stacked-neuron-images-with-noise",
     )
-    print(f"  Shape: {input_stack.shape}  dtype: {input_stack.dtype}")
-    print(f"  Range: [{input_stack.min()}, {input_stack.max()}]")
 
-    # ── Train zero-shot ───────────────────────────────────
-    print("\n[2/4] Zero-shot FM2S training...")
-    print("  Using temporal median as clean target (exploits multi-frame info)")
-    print("  Estimating noise level for adaptive parameters...")
+    for input_tif in input_stack_array:
+        input_tif_result = SimpleITK.ReadImage(input_tif)
+        input_stack = SimpleITK.GetArrayFromImage(input_tif_result)
 
-    model, config = fm2s_train_on_stack(
-        stack=input_stack,
-        device=device,
-        config_overrides=None,  # Use adaptive defaults
-        verbose=True,
-    )
+        print(f"  Shape: {input_stack.shape}  dtype: {input_stack.dtype}")
+        print(f"  Range: [{input_stack.min()}, {input_stack.max()}]")
 
-    print(f"\n  Final config:")
-    for k in ["g_map", "p_map", "lam_p", "n_chan", "train_num",
-              "max_epoch", "val_range", "val_min", "self_ensemble"]:
-        print(f"    {k}: {config.get(k)}")
+        # ── Train zero-shot ───────────────────────────────────
+        print("\n[2/4] Zero-shot FM2S training...")
+        print("  Using temporal median as clean target (exploits multi-frame info)")
+        print("  Estimating noise level for adaptive parameters...")
 
-    # ── Inference ─────────────────────────────────────────
-    print(f"\n[3/4] Denoising {input_stack.shape[0]} frames...")
+        model, config = fm2s_train_on_stack(
+            stack=input_stack,
+            device=device,
+            config_overrides=None,  # Use adaptive defaults
+            verbose=True,
+        )
 
-    denoised = fm2s_denoise_stack(
-        model=model,
-        stack=input_stack.astype(np.float32),
-        config=config,
-        device=device,
-        verbose=True,
-    )
+        print(f"\n  Final config:")
+        for k in ["g_map", "p_map", "lam_p", "n_chan", "train_num",
+                  "max_epoch", "val_range", "val_min", "self_ensemble"]:
+            print(f"    {k}: {config.get(k)}")
 
-    # ── Save output ───────────────────────────────────────
-    print("\n[4/4] Saving output...")
+        # ── Inference ─────────────────────────────────────────
+        print(f"\n[3/4] Denoising {input_stack.shape[0]} frames...")
 
-    # The denoised data is already in the original value range
-    # (fm2s_denoise_frame handles the val_min shift/unshift internally).
-    # Clip to the original data's plausible range.
-    val_min = config.get("val_min", 0.0)
-    val_range = config["val_range"]
-    denoised = np.clip(denoised, val_min, val_min + val_range)
+        denoised = fm2s_denoise_stack(
+            model=model,
+            stack=input_stack.astype(np.float32),
+            config=config,
+            device=device,
+            verbose=True,
+        )
 
-    # Match input dtype
-    if np.issubdtype(input_stack.dtype, np.integer):
-        denoised = np.round(denoised).astype(input_stack.dtype)
-    else:
-        denoised = denoised.astype(np.float32)
+        # ── Save output ───────────────────────────────────────
+        print("\n[4/4] Saving output...")
 
-    print(f"  Output shape: {denoised.shape}  dtype: {denoised.dtype}")
-    print(f"  Output range: [{denoised.min()}, {denoised.max()}]")
+        # The denoised data is already in the original value range
+        # (fm2s_denoise_frame handles the val_min shift/unshift internally).
+        # Clip to the original data's plausible range.
+        val_min = config.get("val_min", 0.0)
+        val_range = config["val_range"]
+        denoised = np.clip(denoised, val_min, val_min + val_range)
 
-    write_array_as_image_file(
-        location=OUTPUT_PATH / "images/stacked-neuron-images-with-reduced-noise",
-        array=denoised,
-    )
+        # Match input dtype
+        if np.issubdtype(input_stack.dtype, np.integer):
+            denoised = np.round(denoised).astype(input_stack.dtype)
+        else:
+            denoised = denoised.astype(np.float32)
 
-    total_time = time.time() - t_total
-    print(f"\n{'='*50}")
-    print(f"Total time: {total_time:.1f}s  ({total_time/60:.1f} min)")
-    print(f"{'='*50}")
+        print(f"  Output shape: {denoised.shape}  dtype: {denoised.dtype}")
+        print(f"  Output range: [{denoised.min()}, {denoised.max()}]")
+
+        write_array_as_image_file(
+            location=OUTPUT_PATH / "images/stacked-neuron-images-with-reduced-noise",
+            array=denoised,
+            name=Path(input_tif).name,
+        )
+
+        total_time = time.time() - t_total
+        print(f"\n{'='*50}")
+        print(f"Total time: {total_time:.1f}s  ({total_time/60:.1f} min)")
+        print(f"{'='*50}")
 
     return 0
 
@@ -143,17 +149,16 @@ def load_image_file_as_array(*, location):
         + glob(str(location / "*.tiff"))
         + glob(str(location / "*.mha"))
     )
-    result = SimpleITK.ReadImage(input_files[5])
-    return SimpleITK.GetArrayFromImage(result)
+    return input_files
 
 
-def write_array_as_image_file(*, location, array):
+def write_array_as_image_file(*, location, array, name):
     location.mkdir(parents=True, exist_ok=True)
     suffix = ".tif"
     image = SimpleITK.GetImageFromArray(array)
     SimpleITK.WriteImage(
         image,
-        location / f"output{suffix}",
+        location / f"{name}",
         useCompression=True,
     )
 

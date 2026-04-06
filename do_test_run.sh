@@ -64,24 +64,24 @@ run_docker_forward_pass() {
     # '-volume ../model:/opt/ml/model/":ro'
     #   is added to provide access to the (optional) tarball-upload locally
 
-    docker run --rm \
-        --platform=linux/amd64 \
-        --network none \
-        --volume "${INPUT_DIR}/${interface_dir}":/input:ro \
-        --volume "${OUTPUT_DIR}/${interface_dir}":/output \
-        --volume "$DOCKER_NOOP_VOLUME":/tmp \
-        --volume "${SCRIPT_DIR}/model":/opt/ml/model:ro \
-        "$DOCKER_IMAGE_TAG"
-
 #    docker run --rm \
 #        --platform=linux/amd64 \
 #        --network none \
-#        --gpus all \
 #        --volume "${INPUT_DIR}/${interface_dir}":/input:ro \
 #        --volume "${OUTPUT_DIR}/${interface_dir}":/output \
 #        --volume "$DOCKER_NOOP_VOLUME":/tmp \
 #        --volume "${SCRIPT_DIR}/model":/opt/ml/model:ro \
 #        "$DOCKER_IMAGE_TAG"
+
+    docker run --rm \
+        --platform=linux/amd64 \
+        --network none \
+        --gpus all \
+        --volume "${INPUT_DIR}/${interface_dir}":/input:ro \
+        --volume "${OUTPUT_DIR}/${interface_dir}":/output \
+        --volume "$DOCKER_NOOP_VOLUME":/tmp \
+        --volume "${SCRIPT_DIR}/model":/opt/ml/model:ro \
+        "$DOCKER_IMAGE_TAG"
 
     echo "=+= Wrote results to ${OUTPUT_DIR}/${interface_dir}"
 }
