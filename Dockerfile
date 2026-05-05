@@ -22,5 +22,6 @@ RUN python -m pip install \
 COPY --chown=user:user inference.py /opt/app/
 COPY --chown=user:user fm2s.py /opt/app/
 COPY --chown=user:user train.py /opt/app/
+COPY --chown=user:user model_dvt.py /opt/app/
 
 ENTRYPOINT ["python", "inference.py"]

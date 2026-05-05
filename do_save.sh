@@ -6,7 +6,7 @@ set -e
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 # Set default container name
-DOCKER_IMAGE_TAG="fm2s-algorithm-phase-1"
+DOCKER_IMAGE_TAG="dvt-algorithm-phase-1"
 
 echo "=+= (Re)build the container"
 source "${SCRIPT_DIR}/do_build.sh"
