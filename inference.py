@@ -39,8 +39,8 @@ from model_dvt import (
 # ─────────────────────────────────────────────────────────────
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
-INPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/input/interf0")
-OUTPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/output/interf0")
+#INPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/input/interf0")
+#OUTPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/output/interf0")
 PRETRAINED_PATH = Path("/opt/ml/model/dvt_weights.pth")  # optional
 
 # Local-test paths (uncomment for local debugging)
