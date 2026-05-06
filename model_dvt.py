@@ -66,7 +66,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from torch.cuda.amp import autocast, GradScaler
 
 # ══════════════════════════════════════════════════════════════
 # NORMALIZATION (p3–p97 robust scaling — kept identical to model.py)
@@ -480,6 +480,9 @@ def train_self_supervised(
     Stage 0 — Temporal-median warmup
     Stage 1 — 3D Blind-spot (Noise2Void)
 
+    Uses fp16 mixed-precision (autocast + GradScaler) on CUDA for ~3×
+    T4 speedup vs fp32. Falls back to fp32 on CPU automatically.
+
     Args:
         stack:  [F, H, W] numpy array (raw, original values).
         device: torch device.
@@ -487,6 +490,8 @@ def train_self_supervised(
     Returns:
         (model, cfg)  — the trained DVTUNet3D and the full config used.
     """
+    from torch.cuda.amp import autocast, GradScaler
+
     t0 = time.time()
     cfg = {
         # backbone
@@ -497,16 +502,16 @@ def train_self_supervised(
         "n_vit_blocks": 2,
         "n_heads": 4,
         # patch sampling
-        "patch_d": 64,
-        "patch_hw": 64,
+        "patch_d": 32,
+        "patch_hw": 128,
         "batch_size": 2,
         # schedule
-        "warmup_iters": 150,
-        "n2v_iters": 6000,
+        "warmup_iters": 500,
+        "n2v_iters": 3000,
         "lr": 3e-4,
         # n2v masking
-        "mask_ratio": 0.015,
-        "mask_radius": 1,
+        "mask_ratio": 0.008,
+        "mask_radius": 2,
     }
     if config:
         cfg.update(config)
@@ -514,6 +519,8 @@ def train_self_supervised(
     F_total, H, W = stack.shape
     pd, phw = cfg["patch_d"], cfg["patch_hw"]
     bs = cfg["batch_size"]
+
+    use_amp = (device.type == "cuda")
 
     if verbose:
         n_tok = int(np.prod(cfg["grid_shape"]))
@@ -525,6 +532,7 @@ def train_self_supervised(
         print(f" Patch: {pd}×{phw}×{phw}, batch={bs}")
         print(f" Stages: warmup={cfg['warmup_iters']}, "
               f"n2v={cfg['n2v_iters']}")
+        print(f" Mixed precision (fp16): {use_amp}")
 
     # Normalize
     norm_params = compute_norm_params(stack)
@@ -583,6 +591,7 @@ def train_self_supervised(
             opt, cfg["warmup_iters"], eta_min=cfg["lr"] * 0.1,
         )
         crit = nn.MSELoss()
+        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
 
@@ -601,18 +610,22 @@ def train_self_supervised(
             inp = torch.stack(patches, dim=0).to(device)
             tgt = torch.stack(targets, dim=0).to(device)
 
-            pred = model(inp)
-            loss = crit(pred, tgt)
             opt.zero_grad()
-            loss.backward()
+            with autocast(enabled=use_amp, dtype=torch.float16):
+                pred = model(inp)
+                loss = crit(pred, tgt)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             sch.step()
             rl += loss.item()
 
-            if verbose and (it + 1) % 200 == 0:
+            if verbose and (it + 1) % 100 == 0:
                 print(f"   {it+1:>5}/{cfg['warmup_iters']} "
-                      f"loss={rl/200:.6f}  {time.time()-t0:.1f}s")
+                      f"loss={rl/100:.6f}  {time.time()-t0:.1f}s")
                 rl = 0.0
 
     # ────────────────────────────────────────────────
@@ -626,6 +639,7 @@ def train_self_supervised(
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["n2v_iters"], eta_min=1e-6,
         )
+        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
 
@@ -645,25 +659,28 @@ def train_self_supervised(
                 all_orig.append((mz, my, mx, orig))
 
             inp = torch.stack(patches, dim=0).to(device)
-            pred = model(inp)
-
-            loss = torch.tensor(0.0, device=device)
-            for b, (mz, my, mx, orig) in enumerate(all_orig):
-                pred_at_mask = pred[b, 0, mz, my, mx]
-                loss = loss + F.mse_loss(pred_at_mask, orig)
-            loss = loss / bs
 
             opt.zero_grad()
-            loss.backward()
+            with autocast(enabled=use_amp, dtype=torch.float16):
+                pred = model(inp)
+                loss = torch.tensor(0.0, device=device)
+                for b, (mz, my, mx, orig) in enumerate(all_orig):
+                    pred_at_mask = pred[b, 0, mz, my, mx]
+                    loss = loss + F.mse_loss(pred_at_mask, orig)
+                loss = loss / bs
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
             sch.step()
             rl += loss.item()
 
-            if verbose and (it + 1) % 500 == 0:
+            if verbose and (it + 1) % 250 == 0:
                 lr_now = sch.get_last_lr()[0]
                 print(f"   {it+1:>5}/{cfg['n2v_iters']} "
-                      f"loss={rl/500:.6f} lr={lr_now:.2e} "
+                      f"loss={rl/250:.6f} lr={lr_now:.2e} "
                       f"{time.time()-t0:.1f}s")
                 rl = 0.0
 
@@ -696,6 +713,8 @@ def denoise_stack(
     phw = max((phw // 4) * 4, 4)
     stride_d  = max(pd  // 2, 4)
     stride_hw = max(phw // 2, 4)
+    # stride_d  = pd 
+    # stride_hw = max(phw // 2, 4)
 
     if verbose:
         print(f" Sliding window: patch={pd}×{phw}×{phw}, "
@@ -742,7 +761,12 @@ def denoise_stack(
                         mode="reflect",
                     )
                 inp = patch.unsqueeze(0).unsqueeze(0)
-                pred = model(inp).squeeze(0).squeeze(0)
+                
+                # pred = model(inp).squeeze(0).squeeze(0)
+                with autocast(dtype=torch.float16):
+                    pred = model(inp).squeeze(0).squeeze(0)
+                pred = pred.float()  # cast back before accumulation
+                
                 pred = pred[:ad, :ah, :aw]
                 win  = gauss_win[:ad, :ah, :aw]
 

@@ -72,7 +72,7 @@ BEST_CONFIG = {
     # ── schedule ─────────────────────────────────────────────
     "warmup_iters":  400,
     "n2v_iters":     4000,
-    "lr":            3e-4,
+    "lr":            5e-4,
     # ── Noise2Void masking ───────────────────────────────────
     "mask_ratio":    0.025,
     "mask_radius":   2,
