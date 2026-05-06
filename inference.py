@@ -39,8 +39,8 @@ from model_dvt import (
 # ─────────────────────────────────────────────────────────────
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
-#INPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/input/interf0")
-#OUTPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/output/interf0")
+INPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/input/interf0")
+OUTPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/output/interf0")
 PRETRAINED_PATH = Path("/opt/ml/model/dvt_weights.pth")  # optional
 
 # Local-test paths (uncomment for local debugging)
@@ -59,23 +59,23 @@ PRETRAINED_PATH = Path("/opt/ml/model/dvt_weights.pth")  # optional
 # under ~1024 unless you have an A100. (4, 8, 8) = 256 is the sweet spot.
 BEST_CONFIG = {
     # ── backbone ─────────────────────────────────────────────
-    "base_ch":       32,
+    "base_ch":       64,
     # ── DVT bottleneck ───────────────────────────────────────
     "token_dim":     192,
     "grid_shape":    (4, 8, 8),     # 256 tokens
     "n_vit_blocks":  2,
     "n_heads":       4,
     # ── patch sampling ───────────────────────────────────────
-    "patch_d":       64,
-    "patch_hw":      64,
+    "patch_d":       32,
+    "patch_hw":      128,
     "batch_size":    2,
     # ── schedule ─────────────────────────────────────────────
-    "warmup_iters":  150,
-    "n2v_iters":     6000,
+    "warmup_iters":  400,
+    "n2v_iters":     4000,
     "lr":            3e-4,
     # ── Noise2Void masking ───────────────────────────────────
-    "mask_ratio":    0.015,
-    "mask_radius":   1,
+    "mask_ratio":    0.025,
+    "mask_radius":   2,
 }
 
 # If you want a fast smoke run during development, swap BEST_CONFIG for:

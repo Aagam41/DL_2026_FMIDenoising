@@ -77,10 +77,10 @@ def compute_norm_params(stack: np.ndarray) -> dict:
     n = min(300, stack.shape[0])
     idx = np.linspace(0, stack.shape[0] - 1, n, dtype=int)
     sampled = stack[idx].astype(np.float64)
-    p3 = float(np.percentile(sampled, 3))
-    p97 = float(np.percentile(sampled, 97))
-    scale = max(p97 - p3, 1e-6)
-    return {"shift": p3, "scale": scale}
+    p_lo = float(np.percentile(sampled, 0.5))
+    p_hi = float(np.percentile(sampled, 99.5))
+    scale = max(p_hi - p_lo, 1e-6)
+    return {"shift": p_lo, "scale": scale}
 
 
 def normalize(data, params):
@@ -285,7 +285,9 @@ class DVTBottleneck(nn.Module):
         # to *re-explain* parts of the noisy ViT output during training
         # (Eqs. 8–10), and it acts as a controlled bypass.
         residual = self.residual_predictor(y)
-        clean_tokens = clean_tokens + 0.1 * residual
+        # clean_tokens = clean_tokens + 0.1 * residual
+        clean_tokens = clean_tokens + 0.05 * residual
+
 
         # ── Unpatchify ─────────────────────────────────────────────
         out = clean_tokens.transpose(1, 2).reshape(B, self.token_dim, Dp, Hp, Wp)
@@ -760,9 +762,15 @@ def denoise_stack(
     output = output.cpu().numpy()
     output = denormalize(output, norm_params)
 
-    safe_lo = norm_params["shift"] - 0.5 * norm_params["scale"]
-    safe_hi = norm_params["shift"] + 1.5 * norm_params["scale"]
-    output = np.clip(output, safe_lo, safe_hi)
+    #safe_lo = norm_params["shift"] - 0.5 * norm_params["scale"]
+    #safe_hi = norm_params["shift"] + 1.5 * norm_params["scale"]
+    #output = np.clip(output, safe_lo, safe_hi)
+    
+    # Clip only to the input's actual range — the original safe_hi was
+    # 1.5×scale above shift, which truncates calcium-transient peaks
+    # that legitimately exceed the 97th percentile.
+    in_lo, in_hi = float(stack.min()), float(stack.max())
+    output = np.clip(output, in_lo, in_hi)
     return output
 
 
