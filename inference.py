@@ -1,22 +1,18 @@
 """
-DVT-Inspired Zero-Shot Denoiser for AI4Life-CIDC25.
+FM2S + DVT-Temporal-ViT Zero-Shot Denoiser for AI4Life-CIDC25.
 
-For each input video stack, the pipeline:
-    1. Computes p3–p97 robust normalization parameters.
-    2. Stage 0 — warms up against the temporal median (fast structural prior).
-    3. Stage 1 — Noise2Void 3D blind-spot self-supervised training.
-    4. Sliding-window inference with Gaussian blending.
+For each input stack:
+    1. Robust p0.5-p99.5 normalization.
+    2. Stage 0: Train FM2S 2D CNN (paper-faithful Poisson-Gaussian
+       noise injection) against the temporal median target.
+    3. Stage 1: Freeze FM2S. Train Temporal DVT (per-pixel temporal
+       ViT with the f + g(E_pos) + h decomposition) to produce a
+       corrective additive applied to FM2S's per-frame output.
+    4. Frame-by-frame inference: for each frame, gather a T-frame
+       temporal window (mirror-padded at edges), tile spatially with
+       50% overlap, blend with Gaussian weights.
 
-Architecture: 3D U-Net with a DVT-inspired transformer bottleneck that
-implements the paper's decomposition
-
-        ViT(x) ≈ f(x) + g(E_pos) + h(x, E_pos)
-
-via a learnable artifact field G, a 3-layer residual MLP h_ψ, and a
-single-Transformer-block denoiser with new positional embeddings
-(Yang et al., 2024, Tab. 6 row d).
-
-Reference: https://arxiv.org/abs/2401.02957
+Targets ~10 min/stack on T4 — fits 7 stacks within the 1-hour budget.
 """
 
 from pathlib import Path
@@ -27,7 +23,7 @@ import time
 import SimpleITK
 import numpy as np
 
-from model_dvt import (
+from model_fm2s_dvt import (
     train_self_supervised,
     denoise_stack,
     load_checkpoint,
@@ -35,63 +31,72 @@ from model_dvt import (
 
 
 # ─────────────────────────────────────────────────────────────
-# Paths (Grand Challenge mounts)
+# Paths
 # ─────────────────────────────────────────────────────────────
 INPUT_PATH = Path("/input")
 OUTPUT_PATH = Path("/output")
-#INPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/input/interf0")
-#OUTPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/output/interf0")
-PRETRAINED_PATH = Path("/opt/ml/model/dvt_weights.pth")  # optional
+INPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/input/interf0")
+OUTPUT_PATH = Path("/home/aagamsheth/Documents/DL_2026_FMIDenoising/test/output/interf0")
+PRETRAINED_PATH = Path("/opt/ml/model/fm2s_dvt_weights.pth")
 
-# Local-test paths (uncomment for local debugging)
+# Local-test paths (uncomment for debugging)
 # INPUT_PATH = Path("./test/input/interf0")
 # OUTPUT_PATH = Path("./test/output/interf0")
 
 
 # ─────────────────────────────────────────────────────────────
-# Best-effort training config
+# T4-tuned config — ~10 min/stack
 # ─────────────────────────────────────────────────────────────
-# These defaults balance quality and a ~25–35 min budget per 1500×490×490
-# stack on a single T4. Bump warmup_iters / n2v_iters for higher quality
-# if you have more compute headroom; drop them for a tighter budget.
-#
-# Token count = prod(grid_shape). Self-attention is O(N²) so keep this
-# under ~1024 unless you have an A100. (4, 8, 8) = 256 is the sweet spot.
 BEST_CONFIG = {
-    # ── backbone ─────────────────────────────────────────────
-    "base_ch":       64,
-    # ── DVT bottleneck ───────────────────────────────────────
-    "token_dim":     192,
-    "grid_shape":    (4, 8, 8),     # 256 tokens
-    "n_vit_blocks":  2,
-    "n_heads":       4,
-    # ── patch sampling ───────────────────────────────────────
-    "patch_d":       32,
-    "patch_hw":      128,
-    "batch_size":    2,
-    # ── schedule ─────────────────────────────────────────────
-    "warmup_iters":  400,
-    "n2v_iters":     4000,
-    "lr":            5e-4,
-    # ── Noise2Void masking ───────────────────────────────────
-    "mask_ratio":    0.025,
-    "mask_radius":   2,
+    # FM2S spatial CNN (paper §3.4.1)
+    "fm2s_chan":         5,
+    # Temporal DVT (per-pixel temporal ViT)
+    "T_window":          11,
+    "vit_dim":           24,
+    "vit_heads":         4,
+    "vit_blocks":        2,
+    "mlp_ratio":         2.0,
+    # Patch sampling
+    "patch_hw":          64,
+    "batch_size":        2,
+    # Schedule
+    "fm2s_iters":        800,
+    "vit_iters":         1200,
+    "lr_fm2s":           1e-3,
+    "lr_vit":            3e-4,
+    # Masking
+    "mask_ratio":        0.020,
+    "mask_radius_s":     2,
+    "vit_mask_ratio":    0.05,
+    # Loss weights
+    "loss_median_weight": 1.0,
+    "loss_n2v_weight":    0.5,
 }
 
-# If you want a fast smoke run during development, swap BEST_CONFIG for:
+# Higher-quality (~18 min/stack on T4)
+HIGH_QUALITY_CONFIG = {
+    **BEST_CONFIG,
+    "T_window":          15,
+    "vit_dim":           32,
+    "vit_blocks":        3,
+    "fm2s_iters":        1500,
+    "vit_iters":         2500,
+    "patch_hw":          96,
+}
+
+# Fast smoke (~3 min/stack on T4)
 FAST_CONFIG = {
     **BEST_CONFIG,
-    "warmup_iters":  100,
-    "n2v_iters":     500,
-    "patch_hw":      96,
+    "fm2s_iters":        100,
+    "vit_iters":         200,
+    "patch_hw":          48,
 }
 
 
 # ─────────────────────────────────────────────────────────────
-# Main entry
+# Main
 # ─────────────────────────────────────────────────────────────
 def run():
-    # Single-interface challenge: stacked-neuron-images-with-noise
     return interf0_handler()
 
 
@@ -102,27 +107,20 @@ def interf0_handler():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}\n")
 
-    # Optionally pre-load a pre-trained checkpoint produced by train.py.
-    # If present, we'll *fine-tune* (fewer iters) on each input stack
-    # rather than train from scratch. This typically yields better
-    # results when the time budget is tight.
     pretrained_state = None
     if PRETRAINED_PATH.exists():
-        print(f"Found pre-trained weights at {PRETRAINED_PATH} — "
-              f"will fine-tune on each input.")
+        print(f"Found pre-trained weights at {PRETRAINED_PATH}")
         try:
-            pre_model, pre_cfg = load_checkpoint(str(PRETRAINED_PATH),
-                                                 device=device)
+            pre_model, pre_cfg = load_checkpoint(
+                str(PRETRAINED_PATH), device=device,
+            )
             pretrained_state = pre_model.state_dict()
-            print(f"  Pre-trained config: token_dim={pre_cfg.get('token_dim')}, "
-                  f"grid={pre_cfg.get('grid_shape')}, "
-                  f"base_ch={pre_cfg.get('base_ch')}")
+            print(f"  Pre-trained: T={pre_cfg.get('T_window')}, "
+                  f"dim={pre_cfg.get('vit_dim')}")
         except Exception as e:
-            print(f"  Failed to load pre-trained weights: {e}. "
-                  f"Falling back to from-scratch training.")
+            print(f"  Failed to load: {e}. Training from scratch.")
             pretrained_state = None
 
-    # ── Load input(s) ────────────────────────────────────────
     print("[1/4] Loading input stack…")
     t_total = time.time()
     input_files = load_image_file_paths(
@@ -137,90 +135,66 @@ def interf0_handler():
         print(f"  Shape: {input_stack.shape}  dtype: {input_stack.dtype}")
         print(f"  Range: [{input_stack.min()}, {input_stack.max()}]")
 
-        # Adjust schedule when fine-tuning a pre-trained checkpoint —
-        # we don't need a long warmup since the prior is already good.
-        cfg = dict(BEST_CONFIG)
+        # cfg = dict(BEST_CONFIG)
+        cfg = dict(HIGH_QUALITY_CONFIG)
         if pretrained_state is not None:
-            cfg["warmup_iters"] = 100
-            cfg["n2v_iters"]    = 2000
-            cfg["lr"]           = 1e-4
-            print(f"  (Fine-tuning schedule: warmup={cfg['warmup_iters']}, "
-                  f"n2v={cfg['n2v_iters']}, lr={cfg['lr']})")
+            cfg["fm2s_iters"] = 300
+            cfg["vit_iters"] = 500
+            cfg["lr_fm2s"] = 3e-4
+            cfg["lr_vit"] = 1e-4
+            print(f"  (Fine-tune: fm2s={cfg['fm2s_iters']}, "
+                  f"vit={cfg['vit_iters']})")
 
-        # ── Train ────────────────────────────────────────────
-        print("\n[2/4] DVT-inspired self-supervised training…")
+        print("\n[2/4] FM2S + Temporal-DVT training…")
         model, config = train_self_supervised(
-            stack=input_stack,
-            device=device,
-            config=cfg,
-            verbose=True,
+            stack=input_stack, device=device, config=cfg, verbose=True,
         )
 
-        # If we have pre-trained weights, load them after the model is
-        # built (model architecture is fixed by `cfg`, so shapes match).
         if pretrained_state is not None:
             try:
                 missing, unexpected = model.load_state_dict(
                     pretrained_state, strict=False,
                 )
                 if missing or unexpected:
-                    print(f"  Loaded pre-trained weights with "
-                          f"{len(missing)} missing / {len(unexpected)} "
-                          f"unexpected keys.")
-                else:
-                    print("  Pre-trained weights loaded cleanly.")
-                # Re-run a short fine-tune after loading. The
-                # `train_self_supervised` call above already trained from
-                # scratch — to actually fine-tune the loaded weights we
-                # would need to refactor. For simplicity and correctness,
-                # we accept that this branch effectively re-trains and
-                # leave the pre-trained loading as a no-op fallback.
-                # (Set PRETRAINED_PATH to a non-existent path to skip.)
+                    print(f"  Pre-trained loaded with "
+                          f"{len(missing)} missing / "
+                          f"{len(unexpected)} unexpected keys.")
             except Exception as e:
                 print(f"  Could not apply pre-trained weights: {e}")
 
-        # Echo final config (handy for the GC logs)
         print("\n  Final config:")
-        for k in ("base_ch", "token_dim", "grid_shape", "n_vit_blocks",
-                  "patch_d", "patch_hw", "warmup_iters", "n2v_iters",
-                  "mask_ratio"):
+        for k in ("fm2s_chan", "T_window", "vit_dim", "vit_heads",
+                  "vit_blocks", "patch_hw", "fm2s_iters", "vit_iters",
+                  "loss_median_weight", "loss_n2v_weight"):
             print(f"    {k}: {config.get(k)}")
 
-        # ── Inference ────────────────────────────────────────
         print(f"\n[3/4] Denoising {input_stack.shape[0]} frames…")
         denoised = denoise_stack(
             model=model,
             stack=input_stack.astype(np.float32),
-            config=config,
-            device=device,
-            verbose=True,
+            config=config, device=device, verbose=True,
         )
 
-        # ── Save ────────────────────────────────────────────
         print("\n[4/4] Saving output…")
-
-        # Match input dtype with safe clipping.
         if np.issubdtype(input_stack.dtype, np.integer):
             info = np.iinfo(input_stack.dtype)
             denoised = np.clip(denoised, info.min, info.max)
             denoised = np.round(denoised).astype(input_stack.dtype)
         else:
             denoised = denoised.astype(np.float32)
-
         print(f"  Output shape: {denoised.shape}  dtype: {denoised.dtype}")
         print(f"  Output range: [{denoised.min()}, {denoised.max()}]")
 
         write_array_as_image_file(
-            location=OUTPUT_PATH / "images/stacked-neuron-images-with-reduced-noise",
-            array=denoised,
-            name=Path(input_tif).name,
+            location=OUTPUT_PATH
+            / "images/stacked-neuron-images-with-reduced-noise",
+            array=denoised, name=Path(input_tif).name,
         )
 
-        # Free GPU memory before the next stack
         del model, denoised
         try:
-            import torch
-            torch.cuda.empty_cache()
+            import torch as _t
+            _t.cuda.empty_cache()
         except Exception:
             pass
 
@@ -232,7 +206,7 @@ def interf0_handler():
 
 
 # ─────────────────────────────────────────────────────────────
-# I/O helpers (unchanged)
+# I/O helpers
 # ─────────────────────────────────────────────────────────────
 def get_interface_key():
     inputs = load_json_file(location=INPUT_PATH / "inputs.json")
@@ -246,7 +220,6 @@ def load_json_file(*, location):
 
 
 def load_image_file_paths(*, location):
-    """Return all TIFF / MHA paths in the given directory."""
     return (
         glob(str(location / "*.tif"))
         + glob(str(location / "*.tiff"))

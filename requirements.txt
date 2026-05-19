@@ -1,4 +1,11 @@
 SimpleITK
+tifffile
 numpy
 scipy
 einops
+matplotlib
+scikit-image
+torch
+# optional but recommended for richer telemetry:
+pynvml
+psutil
