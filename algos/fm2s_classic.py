@@ -21,28 +21,29 @@ import numpy as np
 import torch
 
 from . import _fm2s_paper as _fm2s
+from runner import preprocessing as _prep
+
+# FM2S handles its own scaling internally, so the default normalization
+# is "noop" — but it can still be overridden via config if you want to
+# apply an extra pre-scaling on top (rare).
+DEFAULT_NORMALIZATION = "noop"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
 
 
-# ── Normalization (FM2S normalizes internally; we expose no-ops here) ──
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
 
 def compute_norm_params(stack: np.ndarray) -> dict:
-    """No-op normalization params (FM2S handles scaling internally)."""
-    # We still record the bounds in the params dict so other code that
-    # reads them (e.g. plotting) doesn't crash.
-    return {
-        "shift": 0.0,
-        "scale": 1.0,
-        "in_min": float(stack.min()),
-        "in_max": float(stack.max()),
-    }
+    return _default_norm().compute_params(stack)
 
 
 def normalize(stack, params):
-    return stack.astype(np.float32)
+    return _default_norm().forward(stack, params)
 
 
 def denormalize(stack, params):
-    return stack.astype(np.float32)
+    return _default_norm().inverse(stack, params)
 
 
 # ── Training ──────────────────────────────────────────────────
@@ -51,33 +52,41 @@ def train_self_supervised(stack, device, config=None, verbose=True):
     """
     Train FM2S on the given stack.
 
-    Maps the framework's `config` dict to fm2s_train_on_stack arguments.
+    Maps the framework's `config` dict to fm2s_train_on_stack's
+    `config_overrides` argument (FM2S accepts a single override dict,
+    not individual kwargs).
     """
-    cfg = {
-        "n_chan":         5,
-        "train_num":      450,
-        "max_epoch":      10,
-        "stage1_steps":   10,
-        "lr":             1e-3,
-        "verbose":        verbose,
-    }
+    # Allowed knobs in the FM2S paper module's config_overrides.
+    accepted = ("n_chan", "train_num", "max_epoch", "stage1_steps",
+                "lr", "noise_inj_stride")
+    overrides = {}
     if config:
-        # Filter to the keys fm2s_train_on_stack actually accepts
-        accepted = ("n_chan", "train_num", "max_epoch", "stage1_steps",
-                    "lr", "noise_inj_stride", "verbose")
         for k in accepted:
             if k in config:
-                cfg[k] = config[k]
+                overrides[k] = config[k]
+
+    # Resolve normalization / temporal-target for metadata logging.
+    # FM2S handles its own scaling internally, so these don't change
+    # behavior — they're recorded so the run is traceable.
+    norm_name = (config or {}).get("normalization", DEFAULT_NORMALIZATION)
+    tt_name   = (config or {}).get("temporal_target",
+                                    DEFAULT_TEMPORAL_TARGET)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    tt_strategy   = _prep.resolve_temporal_target(tt_name)
 
     model, returned_cfg = _fm2s.fm2s_train_on_stack(
-        stack=stack, device=device, **cfg,
+        stack=stack, device=device,
+        config_overrides=overrides if overrides else None,
+        verbose=verbose,
     )
 
-    # Stash the norm-params placeholder (the runner expects it)
     out_cfg = dict(returned_cfg)
-    out_cfg["norm_params"] = compute_norm_params(stack)
-    # Preserve framework knobs for downstream inspection
-    out_cfg.update({k: v for k, v in cfg.items() if k not in out_cfg})
+    out_cfg["norm_params"] = norm_strategy.compute_params(stack)
+    out_cfg["__resolved_normalization"] = norm_strategy.name
+    out_cfg["__resolved_temporal_target"] = tt_strategy.name
+    # Surface the FM2S overrides too for completeness
+    for k, v in overrides.items():
+        out_cfg.setdefault(k, v)
     return model, out_cfg
 
 

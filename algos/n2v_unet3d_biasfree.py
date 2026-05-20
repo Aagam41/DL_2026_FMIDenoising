@@ -46,22 +46,30 @@ import torch.nn.functional as F
 # NORMALIZATION (robust p3-p97)
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+# NORMALIZATION (strategy-driven; see runner.preprocessing)
+# ══════════════════════════════════════════════════════════════
+
+from runner import preprocessing as _prep
+
+DEFAULT_NORMALIZATION = "p3_p97"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
+
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
+
 def compute_norm_params(stack: np.ndarray) -> dict:
-    n = min(300, stack.shape[0])
-    idx = np.linspace(0, stack.shape[0] - 1, n, dtype=int)
-    sampled = stack[idx].astype(np.float64)
-    p3 = float(np.percentile(sampled, 3))
-    p97 = float(np.percentile(sampled, 97))
-    scale = max(p97 - p3, 1e-6)
-    return {"shift": p3, "scale": scale}
+    return _default_norm().compute_params(stack)
 
 
 def normalize(data, params):
-    return (data.astype(np.float32) - params["shift"]) / params["scale"]
+    return _default_norm().forward(data, params)
 
 
 def denormalize(data, params):
-    return data.astype(np.float32) * params["scale"] + params["shift"]
+    return _default_norm().inverse(data, params)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -310,19 +318,28 @@ def train_self_supervised(
               f"radius_t={cfg['mask_radius_t']}, "
               f"radius_s={cfg['mask_radius_s']}")
 
-    # Normalize
-    norm_params = compute_norm_params(stack)
+    # ── Normalize (strategy from config) ────────────────
+    norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
-    stack_norm = normalize(stack, norm_params)
+    cfg["__resolved_normalization"] = norm_strategy.name
+    stack_norm = norm_strategy.forward(stack, norm_params)
     if verbose:
-        print(f" Norm: shift={norm_params['shift']:.2f}, "
+        print(f" Norm [{norm_strategy.name}]: "
+              f"shift={norm_params['shift']:.2f}, "
               f"scale={norm_params['scale']:.2f}, "
               f"range=[{stack_norm.min():.3f}, {stack_norm.max():.3f}]")
 
-    # Temporal median (warmup target)
-    n_med = min(500, F_total)
-    med_idx = np.linspace(0, F_total - 1, n_med, dtype=int)
-    temporal_med = np.median(stack_norm[med_idx], axis=0).astype(np.float32)
+    # ── Temporal target (strategy from config) ──────────
+    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
+    tt_strategy = _prep.resolve_temporal_target(tt_name)
+    cfg["__resolved_temporal_target"] = tt_strategy.name
+    if tt_strategy.returns != "2d":
+        _tt_3d = tt_strategy.compute(stack_norm)
+        temporal_med = np.median(_tt_3d, axis=0).astype(np.float32)
+    else:
+        temporal_med = tt_strategy.compute(stack_norm)
 
     stack_t = torch.from_numpy(stack_norm).float().to(device)
     tmed_t = torch.from_numpy(temporal_med).float().to(device)
@@ -467,7 +484,12 @@ def denoise_stack(
         print(f" Sliding window: patch={pd}x{phw}x{phw}, "
               f"stride={stride_d}x{stride_hw}x{stride_hw}")
 
-    stack_norm = normalize(stack, norm_params)
+    # Resolve trained strategy (recorded in config during training)
+    norm_strategy = _prep.resolve_normalization(
+        config.get("__resolved_normalization",
+                    config.get("normalization", DEFAULT_NORMALIZATION))
+    )
+    stack_norm = norm_strategy.forward(stack, norm_params)
     stack_t = torch.from_numpy(stack_norm).float().to(device)
 
     output_sum = torch.zeros(F_total, H, W, device=device)
@@ -523,7 +545,7 @@ def denoise_stack(
 
     output = output_sum / weight_sum.clamp(min=1e-8)
     output = output.cpu().numpy()
-    output = denormalize(output, norm_params)
+    output = norm_strategy.inverse(output, norm_params)
 
     safe_lo = norm_params["shift"] - 0.5 * norm_params["scale"]
     safe_hi = norm_params["shift"] + 1.5 * norm_params["scale"]

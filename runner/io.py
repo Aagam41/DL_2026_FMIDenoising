@@ -105,23 +105,94 @@ def find_stacks(noisy_dir, clean_dir: Optional[Path] = None,
     return pairs
 
 
-# ── Output paths ──────────────────────────────────────────────
+# ── Output paths (group-scoped) ───────────────────────────────
+#
+# Every run lives under a "group" — a single short tag that identifies
+# one benchmark invocation (or one run_one invocation, if used
+# standalone). The layout is:
+#
+#   <results_dir>/<group_id>/runs.csv               ← per-group CSVs
+#   <results_dir>/<group_id>/metrics.csv
+#   <results_dir>/<group_id>/config.csv
+#   <results_dir>/<group_id>/timing.csv
+#   <results_dir>/<group_id>/gpu_log.csv
+#   <results_dir>/<group_id>/stacks.csv
+#   <results_dir>/<group_id>/algos.csv
+#   <results_dir>/<group_id>/group_manifest.json    ← human-readable
+#                                                     config snapshot
+#   <results_dir>/<group_id>/outputs/<run_id>/<stack>.tif
+#   <results_dir>/<group_id>/checkpoints/<run_id>/
+#   <results_dir>/<group_id>/errors/<run_id>.log
+#   <figures_dir>/<group_id>/group_manifest.json    ← mirror
+#   <figures_dir>/<group_id>/<run_id>/<stack>_frame0750.png
+#   <figures_dir>/<group_id>/_leaderboard/<metric>.png
 
-def run_output_dir(results_dir, run_id: str) -> Path:
-    """Where this run's per-stack denoised TIFFs go."""
-    out = Path(results_dir) / "outputs" / run_id
+import uuid as _uuid
+from datetime import datetime as _datetime, timezone as _timezone
+
+
+def make_group_id() -> str:
+    """Fresh group_id used to scope one benchmark invocation."""
+    ts = _datetime.now(_timezone.utc).strftime("%Y%m%d-%H%M%S")
+    sha = _uuid.uuid4().hex[:6]
+    return f"g_{ts}_{sha}"
+
+
+def group_results_dir(results_dir, group_id: str) -> Path:
+    """All result CSVs + outputs for one group."""
+    out = Path(results_dir) / group_id
     out.mkdir(parents=True, exist_ok=True)
     return out
 
 
-def run_figure_dir(figures_dir, run_id: str) -> Path:
-    """Where this run's paper-style comparison figures go."""
-    out = Path(figures_dir) / run_id
+def group_figures_dir(figures_dir, group_id: str) -> Path:
+    """All paper figures for one group."""
+    out = Path(figures_dir) / group_id
     out.mkdir(parents=True, exist_ok=True)
     return out
 
 
-def run_checkpoint_dir(results_dir, run_id: str) -> Path:
-    out = Path(results_dir) / "checkpoints" / run_id
+def run_output_dir(results_dir, group_id: str, run_id: str) -> Path:
+    """Where this run's per-stack denoised TIFFs go (group-scoped)."""
+    out = Path(results_dir) / group_id / "outputs" / run_id
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def run_figure_dir(figures_dir, group_id: str, run_id: str) -> Path:
+    """Where this run's paper-style comparison figures go (group-scoped)."""
+    out = Path(figures_dir) / group_id / run_id
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def run_checkpoint_dir(results_dir, group_id: str, run_id: str) -> Path:
+    out = Path(results_dir) / group_id / "checkpoints" / run_id
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+# ── Group manifest (human-readable per-algo config snapshot) ─────
+
+def write_group_manifest(results_dir, group_id: str,
+                          manifest: dict,
+                          figures_dir=None):
+    """
+    Write `<results_dir>/<group_id>/group_manifest.json` and optionally
+    mirror to `<figures_dir>/<group_id>/group_manifest.json`.
+
+    `manifest` should contain at minimum:
+        group_id, started_at, host, gpu_name, configs (dict[algo -> cfg])
+    """
+    import json
+    grp_path = Path(results_dir) / group_id / "group_manifest.json"
+    grp_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(grp_path, "w") as f:
+        json.dump(manifest, f, indent=2, default=str, sort_keys=True)
+
+    if figures_dir is not None:
+        fig_path = Path(figures_dir) / group_id / "group_manifest.json"
+        fig_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(fig_path, "w") as f:
+            json.dump(manifest, f, indent=2, default=str, sort_keys=True)
+    return grp_path

@@ -62,23 +62,26 @@ from torch.cuda.amp import autocast, GradScaler
 # NORMALIZATION (p3-p97 robust scaling — same as model_dvt.py)
 # ══════════════════════════════════════════════════════════════
 
+from runner import preprocessing as _prep
+
+DEFAULT_NORMALIZATION = "p0.5_p99.5"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
+
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
+
 def compute_norm_params(stack: np.ndarray) -> dict:
-    """Robust percentile-based normalization parameters."""
-    n = min(300, stack.shape[0])
-    idx = np.linspace(0, stack.shape[0] - 1, n, dtype=int)
-    sampled = stack[idx].astype(np.float64)
-    p_lo = float(np.percentile(sampled, 0.5))
-    p_hi = float(np.percentile(sampled, 99.5))
-    scale = max(p_hi - p_lo, 1e-6)
-    return {"shift": p_lo, "scale": scale}
+    return _default_norm().compute_params(stack)
 
 
 def normalize(data, params):
-    return (data.astype(np.float32) - params["shift"]) / params["scale"]
+    return _default_norm().forward(data, params)
 
 
 def denormalize(data, params):
-    return data.astype(np.float32) * params["scale"] + params["shift"]
+    return _default_norm().inverse(data, params)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -589,21 +592,30 @@ def train_self_supervised(
         print(f" Stages: warmup={cfg['warmup_iters']}, n2v={cfg['n2v_iters']}")
         print(f" Mixed precision (fp16): {use_amp}")
 
-    # Normalize
-    norm_params = compute_norm_params(stack)
+    # ── Normalize (strategy from config) ────────────────
+    norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
-    stack_norm = normalize(stack, norm_params)
+    cfg["__resolved_normalization"] = norm_strategy.name
+    stack_norm = norm_strategy.forward(stack, norm_params)
     if verbose:
-        print(f" Norm: shift={norm_params['shift']:.2f}, "
+        print(f" Norm [{norm_strategy.name}]: "
+              f"shift={norm_params['shift']:.2f}, "
               f"scale={norm_params['scale']:.2f}, "
               f"range=[{stack_norm.min():.3f}, {stack_norm.max():.3f}]")
 
-    # Temporal median (warmup target)
-    n_med = min(500, F_total)
-    med_idx = np.linspace(0, F_total - 1, n_med, dtype=int)
-    temporal_med = np.median(stack_norm[med_idx], axis=0).astype(np.float32)
+    # ── Temporal target (strategy from config) ──────────
+    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
+    tt_strategy = _prep.resolve_temporal_target(tt_name)
+    cfg["__resolved_temporal_target"] = tt_strategy.name
+    if tt_strategy.returns != "2d":
+        _tt_3d = tt_strategy.compute(stack_norm)
+        temporal_med = np.median(_tt_3d, axis=0).astype(np.float32)
+    else:
+        temporal_med = tt_strategy.compute(stack_norm)
     if verbose:
-        print(f" Temporal median: "
+        print(f" Temporal target [{tt_strategy.name}]: "
               f"[{temporal_med.min():.3f}, {temporal_med.max():.3f}]")
 
     stack_t = torch.from_numpy(stack_norm).float().to(device)
@@ -787,21 +799,49 @@ def denoise_stack(
     # multiples of 8 (3 down-stages)
     pd = max((pd // 8) * 8, 8)
     phw = max((phw // 8) * 8, 8)
-    stride_d = pd                       # NO time overlap (faster + better)
+    # Temporal overlap: 50% by default. The previous "stride_d = pd"
+    # (no temporal overlap) produced a periodic noisy/clean pattern at
+    # period = pd because frames sitting at the START or END of each
+    # tile saw context only on ONE side, while center frames saw both.
+    # With 50% overlap every frame is now blended from two tiles — one
+    # where it's near the head, one where it's near the tail — so the
+    # head/tail asymmetry averages out. Cost: ~2x more tiles.
+    # Set config["temporal_overlap"] = 0 to restore the old behavior.
+    temporal_overlap_frac = float(config.get("temporal_overlap", 0.5))
+    if temporal_overlap_frac <= 0:
+        stride_d = pd
+    else:
+        stride_d = max(int(pd * (1.0 - temporal_overlap_frac)), 1)
     stride_hw = max(phw // 2, 8)        # 50% spatial overlap
 
     if verbose:
         print(f" Sliding window: patch={pd}x{phw}x{phw}, "
-              f"stride={stride_d}x{stride_hw}x{stride_hw}")
+              f"stride={stride_d}x{stride_hw}x{stride_hw} "
+              f"(temporal overlap {100*(1 - stride_d/pd):.0f}%)")
 
-    stack_norm = normalize(stack, norm_params)
+    norm_strategy = _prep.resolve_normalization(
+        config.get("__resolved_normalization",
+                    config.get("normalization", DEFAULT_NORMALIZATION))
+    )
+    stack_norm = norm_strategy.forward(stack, norm_params)
     stack_t = torch.from_numpy(stack_norm).float().to(device)
 
-    output_sum = torch.zeros(F_total, H, W, device=device)
-    weight_sum = torch.zeros(F_total, H, W, device=device)
-
-    # Window: flat on time (no temporal overlap), gaussian on space
-    g_t = torch.ones(pd, device=device)
+    # ── Temporal window ───────────────────────────────────────
+    # Hann taper when overlapping, flat when not. The Hann window
+    # smoothly down-weights the edges of each tile, so when two
+    # overlapping tiles both contribute to the same output frame, the
+    # tile in which that frame is near the center dominates. The flat
+    # window is kept for the no-overlap case where every output frame
+    # comes from exactly one tile.
+    if stride_d < pd:
+        # Hann window with a small floor so the very-edge frames still
+        # get a tiny positive weight (otherwise weight_sum could go to
+        # zero at boundary cases).
+        idx = torch.arange(pd, device=device, dtype=torch.float32)
+        hann = 0.5 - 0.5 * torch.cos(2 * math.pi * idx / max(pd - 1, 1))
+        g_t = (0.1 + 0.9 * hann).clamp(min=1e-3)
+    else:
+        g_t = torch.ones(pd, device=device)
     spatial_g = _gaussian_window_3d(
         (1, phw, phw), sigma_frac=0.3, device=device,
     ).squeeze(0)                           # [phw, phw]
@@ -809,9 +849,41 @@ def denoise_stack(
         g_t[:, None, None] * spatial_g[None, :, :]
     ).clamp(min=1e-6)                      # [pd, phw, phw]
 
-    z_starts = list(range(0, max(F_total - pd, 0) + 1, stride_d))
-    if not z_starts or z_starts[-1] + pd < F_total:
-        z_starts.append(max(F_total - pd, 0))
+    # ── Mirror-pad the time axis ──────────────────────────────
+    # With 50% temporal overlap, interior frames get two overlapping
+    # tiles, but the first/last `pd//2` frames would otherwise only
+    # be covered by the single boundary tile (with a Hann edge weight
+    # of nearly zero). Mirror-padding the stack by pd//2 frames on
+    # each side gives every ORIGINAL frame at least two tiles' worth
+    # of coverage. We crop back to the original length at the end.
+    if stride_d < pd:
+        tpad = pd // 2
+    else:
+        tpad = 0
+    if tpad > 0:
+        # Mirror reflection along the time axis. Requires tpad < F.
+        if tpad >= F_total:
+            tpad = max(F_total - 1, 0)
+        # F.pad reflect on time: treat as [1, F, H, W] -> pad d dim
+        # We pad with reflect: indices [tpad-1, tpad-2, ..., 1, 0, 0, 1, ..., F-1, F-2, ..., F-tpad]
+        # which means new[0:tpad] = stack[tpad:0:-1] (excluding the seam),
+        # consistent with torch reflect-padding semantics.
+        stack_pad = torch.cat([
+            torch.flip(stack_t[1:tpad+1], dims=[0]),
+            stack_t,
+            torch.flip(stack_t[-tpad-1:-1], dims=[0]),
+        ], dim=0)
+        F_padded = stack_pad.shape[0]
+    else:
+        stack_pad = stack_t
+        F_padded = F_total
+
+    output_sum_pad = torch.zeros(F_padded, H, W, device=device)
+    weight_sum_pad = torch.zeros(F_padded, H, W, device=device)
+
+    z_starts = list(range(0, max(F_padded - pd, 0) + 1, stride_d))
+    if not z_starts or z_starts[-1] + pd < F_padded:
+        z_starts.append(max(F_padded - pd, 0))
     y_starts = list(range(0, max(H - phw, 0) + 1, stride_hw))
     if not y_starts or y_starts[-1] + phw < H:
         y_starts.append(max(H - phw, 0))
@@ -825,18 +897,18 @@ def denoise_stack(
     total = len(z_starts) * len(y_starts) * len(x_starts)
     if verbose:
         print(f" Patches: {len(z_starts)}x{len(y_starts)}x{len(x_starts)}"
-              f" = {total}")
+              f" = {total}  (mirror-pad time +{tpad})")
 
     t0 = time.time()
     done = 0
     for z0 in z_starts:
-        z1 = min(z0 + pd, F_total); ad = z1 - z0
+        z1 = min(z0 + pd, F_padded); ad = z1 - z0
         for y0 in y_starts:
             y1 = min(y0 + phw, H); ah = y1 - y0
             for x0 in x_starts:
                 x1 = min(x0 + phw, W); aw = x1 - x0
 
-                patch = stack_t[z0:z1, y0:y1, x0:x1]
+                patch = stack_pad[z0:z1, y0:y1, x0:x1]
                 if (ad < pd) or (ah < phw) or (aw < phw):
                     patch = F.pad(
                         patch,
@@ -849,8 +921,8 @@ def denoise_stack(
                 pred = pred[:ad, :ah, :aw]
                 win = gauss_win[:ad, :ah, :aw]
 
-                output_sum[z0:z1, y0:y1, x0:x1] += pred * win
-                weight_sum[z0:z1, y0:y1, x0:x1] += win
+                output_sum_pad[z0:z1, y0:y1, x0:x1] += pred * win
+                weight_sum_pad[z0:z1, y0:y1, x0:x1] += win
 
                 done += 1
                 if verbose:
@@ -861,9 +933,17 @@ def denoise_stack(
     if verbose:
         print(f"\n Inference: {total} patches in {time.time()-t0:.1f}s")
 
+    # Crop back to original time length (remove the mirror-pad we added)
+    if tpad > 0:
+        output_sum = output_sum_pad[tpad:tpad+F_total]
+        weight_sum = weight_sum_pad[tpad:tpad+F_total]
+    else:
+        output_sum = output_sum_pad
+        weight_sum = weight_sum_pad
+
     output = output_sum / weight_sum.clamp(min=1e-8)
     output = output.cpu().numpy()
-    output = denormalize(output, norm_params)
+    output = norm_strategy.inverse(output, norm_params)
 
     # Replace any NaN/Inf with sane values (fp16 leakage guard)
     output = np.nan_to_num(

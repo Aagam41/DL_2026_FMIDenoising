@@ -37,26 +37,42 @@ import math
 
 
 # ══════════════════════════════════════════════════════════════
-#  NORMALIZATION (p3–p97 robust scaling)
+#  NORMALIZATION (now strategy-driven; see runner.preprocessing)
 # ══════════════════════════════════════════════════════════════
+#
+# This algo's default strategy: "p3_p97" (subsampled percentile scaling
+# at 3%-97%). Override via config["normalization"] at runtime.
+#
+# The module-level `compute_norm_params` / `normalize` / `denormalize`
+# functions below use the DEFAULT strategy. They exist for
+# backwards-compatibility with code that imports these names directly
+# (e.g. older inference.py scripts, the checkpoint loader, etc.).
+#
+# Inside training, the runtime strategy is picked from config and may
+# differ from this default.
+
+from runner import preprocessing as _prep
+
+DEFAULT_NORMALIZATION = "p3_p97"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
+
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
 
 def compute_norm_params(stack: np.ndarray) -> dict:
-    """Robust percentile-based normalization parameters."""
-    n = min(300, stack.shape[0])
-    idx = np.linspace(0, stack.shape[0] - 1, n, dtype=int)
-    sampled = stack[idx].astype(np.float64)
-    p3  = float(np.percentile(sampled, 3))
-    p97 = float(np.percentile(sampled, 97))
-    scale = max(p97 - p3, 1e-6)
-    return {"shift": p3, "scale": scale}
+    """Compute normalization params using the algo default strategy.
+    Use runner.preprocessing.resolve_normalization() for other choices."""
+    return _default_norm().compute_params(stack)
 
 
 def normalize(data, params):
-    return (data.astype(np.float32) - params["shift"]) / params["scale"]
+    return _default_norm().forward(data, params)
 
 
 def denormalize(data, params):
-    return data.astype(np.float32) * params["scale"] + params["shift"]
+    return _default_norm().inverse(data, params)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -289,22 +305,35 @@ def train_self_supervised(
         print(f"  Patch: {pd}×{phw}×{phw}, batch={bs}")
         print(f"  Stages: warmup={cfg['warmup_iters']}, n2v={cfg['n2v_iters']}")
 
-    # ── Normalize (p3–p97) ────────────────────────────
-    norm_params = compute_norm_params(stack)
+    # ── Normalize (strategy from config; default = DEFAULT_NORMALIZATION) ──
+    norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
-    stack_norm = normalize(stack, norm_params)
+    cfg["__resolved_normalization"] = norm_strategy.name
+    stack_norm = norm_strategy.forward(stack, norm_params)
 
     if verbose:
-        print(f"  Norm: shift={norm_params['shift']:.2f}, "
+        print(f"  Norm [{norm_strategy.name}]: "
+              f"shift={norm_params['shift']:.2f}, "
               f"scale={norm_params['scale']:.2f}, "
               f"range=[{stack_norm.min():.3f}, {stack_norm.max():.3f}]")
 
-    # ── Temporal median (for warmup target) ───────────
-    n_med = min(500, F_total)
-    med_idx = np.linspace(0, F_total - 1, n_med, dtype=int)
-    temporal_med = np.median(stack_norm[med_idx], axis=0).astype(np.float32)
+    # ── Temporal target (strategy from config) ───────────
+    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
+    tt_strategy = _prep.resolve_temporal_target(tt_name)
+    cfg["__resolved_temporal_target"] = tt_strategy.name
+    if tt_strategy.returns != "2d":
+        # This algo's warmup expects a 2D [H, W] target; collapse a 3D
+        # target by taking its median along time. (Keeps the algo
+        # working with strategies that return per-frame volumes.)
+        _tt_3d = tt_strategy.compute(stack_norm)
+        temporal_med = np.median(_tt_3d, axis=0).astype(np.float32)
+    else:
+        temporal_med = tt_strategy.compute(stack_norm)
     if verbose:
-        print(f"  Temporal median: [{temporal_med.min():.3f}, {temporal_med.max():.3f}]")
+        print(f"  Temporal target [{tt_strategy.name}]: "
+              f"[{temporal_med.min():.3f}, {temporal_med.max():.3f}]")
 
     # Move to GPU
     stack_t = torch.from_numpy(stack_norm).float().to(device)      # [F, H, W]
@@ -480,8 +509,15 @@ def denoise_stack(
         print(f"  Sliding window: patch={pd}×{phw}×{phw}, "
               f"stride={stride_d}×{stride_hw}×{stride_hw}")
 
+    # Resolve the strategy that was used during training (recorded in
+    # config). Fall back to the algo default if not present.
+    norm_strategy = _prep.resolve_normalization(
+        config.get("__resolved_normalization",
+                    config.get("normalization", DEFAULT_NORMALIZATION))
+    )
+
     # Normalize
-    stack_norm = normalize(stack, norm_params)
+    stack_norm = norm_strategy.forward(stack, norm_params)
     stack_t = torch.from_numpy(stack_norm).float().to(device)
 
     # Output buffers (accumulate weighted predictions)
@@ -557,10 +593,10 @@ def denoise_stack(
         print(f"\n  Inference: {total_patches} patches in "
               f"{time.time()-t0:.1f}s")
 
-    # Divide by weight and denormalize
+    # Divide by weight and denormalize using the trained strategy
     output = output_sum / weight_sum.clamp(min=1e-8)
     output = output.cpu().numpy()
-    output = denormalize(output, norm_params)
+    output = norm_strategy.inverse(output, norm_params)
 
     # Clamp to safe range
     safe_lo = norm_params["shift"] - 0.5 * norm_params["scale"]

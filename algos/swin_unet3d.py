@@ -64,23 +64,26 @@ from torch.cuda.amp import autocast, GradScaler
 # NORMALIZATION
 # ══════════════════════════════════════════════════════════════
 
+from runner import preprocessing as _prep
+
+DEFAULT_NORMALIZATION = "p0.5_p99.5"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
+
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
+
 def compute_norm_params(stack: np.ndarray) -> dict:
-    """Robust p0.5-p99.5 percentile normalization."""
-    n = min(300, stack.shape[0])
-    idx = np.linspace(0, stack.shape[0] - 1, n, dtype=int)
-    sampled = stack[idx].astype(np.float64)
-    p_lo = float(np.percentile(sampled, 0.5))
-    p_hi = float(np.percentile(sampled, 99.5))
-    scale = max(p_hi - p_lo, 1e-6)
-    return {"shift": p_lo, "scale": scale}
+    return _default_norm().compute_params(stack)
 
 
 def normalize(data, params):
-    return (data.astype(np.float32) - params["shift"]) / params["scale"]
+    return _default_norm().forward(data, params)
 
 
 def denormalize(data, params):
-    return data.astype(np.float32) * params["scale"] + params["shift"]
+    return _default_norm().inverse(data, params)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -657,16 +660,25 @@ def train_self_supervised(stack, device, config=None, verbose=True):
               f"radius_s={cfg['mask_radius_s']}, radius_t={cfg['mask_radius_t']}")
         print(f" Mixed precision (fp16): {use_amp}")
 
-    norm_params = compute_norm_params(stack)
+    norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
-    stack_norm = normalize(stack, norm_params)
+    cfg["__resolved_normalization"] = norm_strategy.name
+    stack_norm = norm_strategy.forward(stack, norm_params)
     if verbose:
-        print(f" Norm: shift={norm_params['shift']:.2f}, scale={norm_params['scale']:.2f}")
+        print(f" Norm [{norm_strategy.name}]: "
+              f"shift={norm_params['shift']:.2f}, scale={norm_params['scale']:.2f}")
 
-    # Temporal median for warmup
-    n_med = min(500, F_total)
-    med_idx = np.linspace(0, F_total - 1, n_med, dtype=int)
-    temporal_med = np.median(stack_norm[med_idx], axis=0).astype(np.float32)
+    # Temporal target (strategy from config)
+    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
+    tt_strategy = _prep.resolve_temporal_target(tt_name)
+    cfg["__resolved_temporal_target"] = tt_strategy.name
+    if tt_strategy.returns != "2d":
+        _tt_3d = tt_strategy.compute(stack_norm)
+        temporal_med = np.median(_tt_3d, axis=0).astype(np.float32)
+    else:
+        temporal_med = tt_strategy.compute(stack_norm)
 
     stack_t = torch.from_numpy(stack_norm).float().to(device)
     tmed_t  = torch.from_numpy(temporal_med).float().to(device)
@@ -822,7 +834,11 @@ def denoise_stack(model, stack, config, device, verbose=True):
         print(f" Sliding window: patch={pd}x{phw}x{phw}, "
               f"stride={stride_d}x{stride_hw}x{stride_hw}")
 
-    stack_norm = normalize(stack, norm_params)
+    norm_strategy = _prep.resolve_normalization(
+        config.get("__resolved_normalization",
+                    config.get("normalization", DEFAULT_NORMALIZATION))
+    )
+    stack_norm = norm_strategy.forward(stack, norm_params)
     stack_t = torch.from_numpy(stack_norm).float().to(device)
 
     output_sum = torch.zeros(F_total, H, W, device=device)
@@ -878,7 +894,7 @@ def denoise_stack(model, stack, config, device, verbose=True):
 
     output = output_sum / weight_sum.clamp(min=1e-8)
     output = output.cpu().numpy()
-    output = denormalize(output, norm_params)
+    output = norm_strategy.inverse(output, norm_params)
 
     # Safety: NaN/Inf clean up + clip to input range with headroom
     output = np.nan_to_num(

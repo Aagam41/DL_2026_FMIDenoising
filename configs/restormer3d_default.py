@@ -8,7 +8,7 @@ CONFIG = {
 
     "dim":                    32,
     "num_blocks":             (2, 2, 2, 3),
-    "num_refinement_blocks":  2,
+    "num_refinement_blocks":  3,
     "heads":                  (1, 2, 4, 8),
     "ffn_expansion_factor":   2.0,
     "bias_free":              True,
@@ -18,8 +18,11 @@ CONFIG = {
     "batch_size":    2,
 
     "warmup_iters":  200,
-    "n2v_iters":     3000,
+    "n2v_iters":     4000,
     "lr":            3e-4,
-    "mask_ratio":    0.015,
-    "mask_radius":   1,
+    "mask_ratio":    0.025,
+    "mask_radius":   2,
+
+    "normalization": "chhayansh",
+    "temporal_target": "temporal_median_2d",
 }

@@ -59,21 +59,30 @@ PRETRAINED_WEIGHTS = Path(__file__).resolve().parent / "_weights" / "n2v_3d_chha
 # NORMALIZATION  (p3-p97 percentile scaling — matches upstream)
 # ══════════════════════════════════════════════════════════════
 
+from runner import preprocessing as _prep
+
+# IMPORTANT: the shipped pre-trained weights were trained with p3-p97
+# percentile scaling on the FULL volume. Changing the default would
+# break inference with those weights. Override at your own risk via
+# config["normalization"].
+DEFAULT_NORMALIZATION = "chhayansh"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
+
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
+
 def compute_norm_params(stack: np.ndarray) -> dict:
-    """Match upstream: p3 / p97 of the whole stack."""
-    sampled = stack.astype(np.float64)
-    p3  = float(np.percentile(sampled, 3))
-    p97 = float(np.percentile(sampled, 97))
-    scale = max(p97 - p3, 1e-6)
-    return {"shift": p3, "scale": scale, "p3": p3, "p97": p97}
+    return _default_norm().compute_params(stack)
 
 
 def normalize(data, params):
-    return (data.astype(np.float32) - params["shift"]) / params["scale"]
+    return _default_norm().forward(data, params)
 
 
 def denormalize(data, params):
-    return data.astype(np.float32) * params["scale"] + params["shift"]
+    return _default_norm().inverse(data, params)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -223,8 +232,26 @@ def train_self_supervised(stack, device, config=None, verbose=True):
 
     # ── Build the model ───────────────────────────────────────
     model = UNet3D().to(device)
-    norm_params = compute_norm_params(stack)
+
+    # Resolve normalization strategy. Default = "chhayansh" (p3-p97
+    # full-volume) which is what the shipped weights expect.
+    norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
+    cfg["__resolved_normalization"] = norm_strategy.name
+    # We don't use a temporal-target in chhayansh (no warmup stage), but
+    # record the resolution anyway for traceability.
+    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
+    cfg["__resolved_temporal_target"] = _prep.resolve_temporal_target(tt_name).name
+
+    if verbose:
+        print(f"   Normalization: {norm_strategy.name}")
+        if norm_strategy.name != "chhayansh":
+            print(f"   WARNING: using non-default normalization with "
+                  f"shipped pre-trained weights may produce poor output. "
+                  f"The upstream model was trained on 'chhayansh' "
+                  f"(p3-p97 full-volume).")
 
     # ── Inference-only path ───────────────────────────────────
     if cfg["load_pretrained"]:
@@ -254,7 +281,7 @@ def train_self_supervised(stack, device, config=None, verbose=True):
         return model, cfg
 
     # ── Training path ─────────────────────────────────────────
-    stack_norm = normalize(stack, norm_params)
+    stack_norm = norm_strategy.forward(stack, norm_params)
     stack_t = torch.from_numpy(stack_norm).float().to(device)
 
     def random_patch():
@@ -351,7 +378,11 @@ def denoise_stack(model, stack, config, device, verbose=True):
         print(f" Sliding window: tile={td}x{thw}x{thw}, "
               f"overlap={od}/{ohw}, stride={sd}/{shw}")
 
-    stack_norm = normalize(stack, norm_params)
+    norm_strategy = _prep.resolve_normalization(
+        config.get("__resolved_normalization",
+                    config.get("normalization", DEFAULT_NORMALIZATION))
+    )
+    stack_norm = norm_strategy.forward(stack, norm_params)
     stack_t = torch.from_numpy(stack_norm).float().to(device)
 
     prediction = torch.zeros(F_total, H, W, device=device)
@@ -387,7 +418,7 @@ def denoise_stack(model, stack, config, device, verbose=True):
 
     prediction = prediction / counts.clamp(min=1e-8)
     output = prediction.cpu().numpy()
-    output = denormalize(output, norm_params)
+    output = norm_strategy.inverse(output, norm_params)
 
     # ── Safety net (cheap, matches the rest of the framework) ──
     output = np.nan_to_num(

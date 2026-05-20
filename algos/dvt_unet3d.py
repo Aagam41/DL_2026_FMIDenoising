@@ -72,23 +72,26 @@ from torch.cuda.amp import autocast, GradScaler
 # NORMALIZATION (p3–p97 robust scaling — kept identical to model.py)
 # ══════════════════════════════════════════════════════════════
 
+from runner import preprocessing as _prep
+
+DEFAULT_NORMALIZATION = "p0.5_p99.5"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
+
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
+
 def compute_norm_params(stack: np.ndarray) -> dict:
-    """Robust percentile-based normalization parameters."""
-    n = min(300, stack.shape[0])
-    idx = np.linspace(0, stack.shape[0] - 1, n, dtype=int)
-    sampled = stack[idx].astype(np.float64)
-    p_lo = float(np.percentile(sampled, 0.5))
-    p_hi = float(np.percentile(sampled, 99.5))
-    scale = max(p_hi - p_lo, 1e-6)
-    return {"shift": p_lo, "scale": scale}
+    return _default_norm().compute_params(stack)
 
 
 def normalize(data, params):
-    return (data.astype(np.float32) - params["shift"]) / params["scale"]
+    return _default_norm().forward(data, params)
 
 
 def denormalize(data, params):
-    return data.astype(np.float32) * params["scale"] + params["shift"]
+    return _default_norm().inverse(data, params)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -265,29 +268,37 @@ class DVTBottleneck(nn.Module):
         tokens = self.patch_embed(x_pool)                              # [B,Td,Dp,Hp,Wp]
         tokens = tokens.flatten(2).transpose(1, 2)                     # [B,N,Td]
 
-        # ── Pre-denoiser ViT (the "raw ViT output" y in the paper) ──
-        y = tokens
-        for blk in self.vit_blocks:
-            y = blk(y)
+        # ── Pre-denoiser ViT + DVT decomposition (FP32 enforced) ────
+        # The attention softmax (Q @ K.T / sqrt(d) → exp) is the
+        # fp16-overflow culprit. With high-magnitude inputs (e.g. when
+        # the user picks a tighter normalization like p3_p97 which
+        # produces inputs reaching ~23), Q*K reaches values whose
+        # exp() saturates fp16 and produces NaN. The conv encoder/
+        # decoder runs fp16 fine; only the transformer needs fp32.
+        # The artifact_field, denoiser_pe, and residual_predictor are
+        # all inside this block since they all touch token features.
+        with autocast(enabled=False):
+            y = tokens.float()
+            for blk in self.vit_blocks:
+                y = blk(y)
 
-        # ── DVT decomposition (Eq. 10 in the paper) ────────────────
-        # Subtract artifact field G (input-independent) ...
-        y_minus_g = y - self.artifact_field
-        # ... add learnable post-PE for the denoiser (Tab. 6 row d) ...
-        y_for_denoiser = y_minus_g + self.denoiser_pe
-        # ... and run the single-block denoiser to get the clean
-        # semantics F.
-        clean_tokens = self.denoiser_block(y_for_denoiser)
+            # ── DVT decomposition (Eq. 10 in the paper) ────────────
+            # Subtract artifact field G (input-independent) ...
+            y_minus_g = y - self.artifact_field.float()
+            # ... add learnable post-PE for the denoiser (Tab. 6 row d) ...
+            y_for_denoiser = y_minus_g + self.denoiser_pe.float()
+            # ... and run the single-block denoiser to get the clean
+            # semantics F.
+            clean_tokens = self.denoiser_block(y_for_denoiser)
 
-        # Residual term ĥ = h_ψ(y). We mix a small fraction back so that
-        # signal-dependent fluctuations the denoiser shouldn't kill (e.g.
-        # genuine calcium transients) survive — the paper uses this term
-        # to *re-explain* parts of the noisy ViT output during training
-        # (Eqs. 8–10), and it acts as a controlled bypass.
-        residual = self.residual_predictor(y)
-        # clean_tokens = clean_tokens + 0.1 * residual
-        clean_tokens = clean_tokens + 0.05 * residual
-
+            # Residual term ĥ = h_ψ(y). We mix a small fraction back so
+            # that signal-dependent fluctuations the denoiser shouldn't
+            # kill (e.g. genuine calcium transients) survive — the
+            # paper uses this term to *re-explain* parts of the noisy
+            # ViT output during training (Eqs. 8–10), and it acts as
+            # a controlled bypass.
+            residual = self.residual_predictor(y)
+            clean_tokens = clean_tokens + 0.05 * residual
 
         # ── Unpatchify ─────────────────────────────────────────────
         out = clean_tokens.transpose(1, 2).reshape(B, self.token_dim, Dp, Hp, Wp)
@@ -520,7 +531,13 @@ def train_self_supervised(
     pd, phw = cfg["patch_d"], cfg["patch_hw"]
     bs = cfg["batch_size"]
 
-    use_amp = (device.type == "cuda")
+    # use_amp is fp16 mixed precision. Default ON for CUDA, OFF for CPU.
+    # Can be forced off via config["use_amp"]=False for full fp32 training
+    # (~3x slower on T4) if attention overflow is suspected with a custom
+    # normalization. The DVT bottleneck's transformer blocks are ALWAYS
+    # run in fp32 regardless of this flag (see DVTBottleneck.forward),
+    # so use_amp=True is generally safe.
+    use_amp = cfg.get("use_amp", device.type == "cuda")
 
     if verbose:
         n_tok = int(np.prod(cfg["grid_shape"]))
@@ -534,21 +551,30 @@ def train_self_supervised(
               f"n2v={cfg['n2v_iters']}")
         print(f" Mixed precision (fp16): {use_amp}")
 
-    # Normalize
-    norm_params = compute_norm_params(stack)
+    # ── Normalize (strategy from config) ────────────────
+    norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
-    stack_norm = normalize(stack, norm_params)
+    cfg["__resolved_normalization"] = norm_strategy.name
+    stack_norm = norm_strategy.forward(stack, norm_params)
     if verbose:
-        print(f" Norm: shift={norm_params['shift']:.2f}, "
+        print(f" Norm [{norm_strategy.name}]: "
+              f"shift={norm_params['shift']:.2f}, "
               f"scale={norm_params['scale']:.2f}, "
               f"range=[{stack_norm.min():.3f}, {stack_norm.max():.3f}]")
 
-    # Temporal median (warmup target)
-    n_med = min(500, F_total)
-    med_idx = np.linspace(0, F_total - 1, n_med, dtype=int)
-    temporal_med = np.median(stack_norm[med_idx], axis=0).astype(np.float32)
+    # ── Temporal target (strategy from config) ──────────
+    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
+    tt_strategy = _prep.resolve_temporal_target(tt_name)
+    cfg["__resolved_temporal_target"] = tt_strategy.name
+    if tt_strategy.returns != "2d":
+        _tt_3d = tt_strategy.compute(stack_norm)
+        temporal_med = np.median(_tt_3d, axis=0).astype(np.float32)
+    else:
+        temporal_med = tt_strategy.compute(stack_norm)
     if verbose:
-        print(f" Temporal median: "
+        print(f" Temporal target [{tt_strategy.name}]: "
               f"[{temporal_med.min():.3f}, {temporal_med.max():.3f}]")
 
     stack_t = torch.from_numpy(stack_norm).float().to(device)   # [F, H, W]
@@ -642,6 +668,16 @@ def train_self_supervised(
         scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
+        # NaN guard: snapshot weights periodically. If loss goes NaN
+        # (typically from fp16 overflow on outlier patches), restore
+        # the last known-good weights and reduce LR for this step. We
+        # also count consecutive NaN steps and abort with a clear
+        # message if the network is stuck.
+        nan_consecutive = 0
+        nan_total = 0
+        last_good_state = None
+        snapshot_every = 100
+        max_consecutive_nan = 50
 
         for it in range(cfg["n2v_iters"]):
             all_orig = []
@@ -669,20 +705,94 @@ def train_self_supervised(
                     loss = loss + F.mse_loss(pred_at_mask, orig)
                 loss = loss / bs
 
+            # ── NaN guard ────────────────────────────────────────
+            loss_is_bad = (not torch.isfinite(loss)) or torch.isnan(loss)
+            if loss_is_bad:
+                nan_consecutive += 1
+                nan_total += 1
+                # Skip the gradient update — leave weights where they are.
+                # scaler.update() is required to keep the scaler healthy
+                # since we already called scaler.scale(...) above (we
+                # didn't actually, when loss is NaN we skip the whole
+                # backward). Reset gradients explicitly:
+                opt.zero_grad(set_to_none=True)
+                if nan_consecutive == 1 and verbose:
+                    print(f"   NaN at iter {it+1} — skipping update "
+                          f"(may roll back weights if persistent)")
+                # If we've snapshotted weights and NaN persists, restore
+                if (nan_consecutive >= 5 and last_good_state is not None):
+                    model.load_state_dict(last_good_state)
+                    if verbose and nan_consecutive == 5:
+                        print(f"   Rolled back weights to last "
+                              f"snapshot at iter {it+1}")
+                if nan_consecutive >= max_consecutive_nan:
+                    if verbose:
+                        print(f"   ABORTING N2V — {nan_consecutive} "
+                              f"consecutive NaN steps. Likely fp16 "
+                              f"overflow. Try a tighter normalization "
+                              f"(e.g. 'p0.5_p99.5'), lower lr, or "
+                              f"disable AMP.")
+                    break
+                continue
+
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
+            # Skip step if gradients themselves are non-finite — also
+            # protects against silent NaN propagation.
+            grad_ok = True
+            for p in model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    grad_ok = False
+                    break
+            if not grad_ok:
+                nan_consecutive += 1
+                nan_total += 1
+                opt.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
+
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
             sch.step()
             rl += loss.item()
+            nan_consecutive = 0
+
+            # Periodically snapshot weights as a rollback point
+            if (it + 1) % snapshot_every == 0:
+                last_good_state = {
+                    k: v.detach().clone() for k, v in model.state_dict().items()
+                }
 
             if verbose and (it + 1) % 250 == 0:
                 lr_now = sch.get_last_lr()[0]
+                avg_loss = rl / 250
+                extra = f"  (NaN skipped: {nan_total})" if nan_total else ""
                 print(f"   {it+1:>5}/{cfg['n2v_iters']} "
-                      f"loss={rl/250:.6f} lr={lr_now:.2e} "
-                      f"{time.time()-t0:.1f}s")
+                      f"loss={avg_loss:.6f} lr={lr_now:.2e} "
+                      f"{time.time()-t0:.1f}s{extra}")
                 rl = 0.0
+
+        if nan_total > 0 and verbose:
+            print(f"   Total NaN steps skipped: {nan_total} "
+                  f"of {cfg['n2v_iters']} "
+                  f"({100*nan_total/cfg['n2v_iters']:.1f}%)")
+        # Final safety: if model state is corrupted with NaN, restore
+        # from last snapshot (or abort cleanly).
+        any_nan_in_weights = any(
+            (not torch.isfinite(p).all()) for p in model.parameters()
+        )
+        if any_nan_in_weights:
+            if last_good_state is not None:
+                model.load_state_dict(last_good_state)
+                if verbose:
+                    print(f"   Final model had NaN weights — restored "
+                          f"from snapshot.")
+            else:
+                if verbose:
+                    print(f"   WARN: model has NaN weights and no "
+                          f"snapshot available. Inference will likely "
+                          f"produce garbage.")
 
     elapsed = time.time() - t0
     if verbose:
@@ -720,7 +830,12 @@ def denoise_stack(
         print(f" Sliding window: patch={pd}×{phw}×{phw}, "
               f"stride={stride_d}×{stride_hw}×{stride_hw}")
 
-    stack_norm = normalize(stack, norm_params)
+    # Resolve trained strategy
+    norm_strategy = _prep.resolve_normalization(
+        config.get("__resolved_normalization",
+                    config.get("normalization", DEFAULT_NORMALIZATION))
+    )
+    stack_norm = norm_strategy.forward(stack, norm_params)
     stack_t = torch.from_numpy(stack_norm).float().to(device)
 
     output_sum = torch.zeros(F_total, H, W, device=device)
@@ -784,12 +899,33 @@ def denoise_stack(
 
     output = output_sum / weight_sum.clamp(min=1e-8)
     output = output.cpu().numpy()
-    output = denormalize(output, norm_params)
 
-    #safe_lo = norm_params["shift"] - 0.5 * norm_params["scale"]
-    #safe_hi = norm_params["shift"] + 1.5 * norm_params["scale"]
-    #output = np.clip(output, safe_lo, safe_hi)
-    
+    # ── Catastrophic-failure guard ───────────────────────────
+    # If the model was wiped to NaN during training (e.g. fp16
+    # attention overflow on outlier patches), the inference output will
+    # be all-NaN. Detect this and fall back to the noisy input rather
+    # than silently writing a black TIFF that the user then has to
+    # diagnose. This will hurt metrics but produces a usable file and
+    # a clear warning instead of zeros.
+    n_bad = int((~np.isfinite(output)).sum())
+    total_voxels = output.size
+    bad_frac = n_bad / max(total_voxels, 1)
+    if bad_frac > 0.5:
+        if verbose:
+            print(f"\n WARNING: {100*bad_frac:.1f}% of output voxels are "
+                  f"NaN/Inf — model likely diverged during training. "
+                  f"Falling back to the noisy input. "
+                  f"Try config['normalization']='p0.5_p99.5' (algo default) "
+                  f"and/or a lower lr.")
+        return stack.astype(np.float32)
+    if n_bad > 0:
+        if verbose:
+            print(f" Replacing {n_bad} non-finite voxels with input")
+        bad_mask = ~np.isfinite(output)
+        output[bad_mask] = stack.astype(np.float32)[bad_mask]
+
+    output = norm_strategy.inverse(output, norm_params)
+
     # Clip only to the input's actual range — the original safe_hi was
     # 1.5×scale above shift, which truncates calcium-transient peaks
     # that legitimately exceed the 97th percentile.

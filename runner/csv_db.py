@@ -82,13 +82,26 @@ def append_rows(csv_path: Path, rows: Iterable[Dict[str, Any]]):
 
 
 # ── High-level helpers for each table ──────────────────────────
+#
+# All helpers accept a `group_id` and write to
+# <results_dir>/<group_id>/<table>.csv. If group_id is None, the helper
+# writes to <results_dir>/<table>.csv for backwards compatibility with
+# older code that didn't know about groups. New code should always pass
+# a group_id.
 
-def write_run(results_dir: Path, run: Dict[str, Any]):
+def _table_path(results_dir, table: str, group_id=None) -> Path:
+    if group_id is None:
+        return Path(results_dir) / table
+    return Path(results_dir) / group_id / table
+
+
+def write_run(results_dir: Path, run: Dict[str, Any], group_id=None):
     """One row in runs.csv. Required keys: run_id, algo, stack, status."""
-    append_row(Path(results_dir) / "runs.csv", run)
+    append_row(_table_path(results_dir, "runs.csv", group_id), run)
 
 
-def write_metrics(results_dir: Path, run_id: str, metrics: Dict[str, float]):
+def write_metrics(results_dir: Path, run_id: str, metrics: Dict[str, float],
+                   group_id=None):
     """One row per metric for this run."""
     rows = []
     for name, value in metrics.items():
@@ -97,10 +110,11 @@ def write_metrics(results_dir: Path, run_id: str, metrics: Dict[str, float]):
             "metric": name,
             "value": value,
         })
-    append_rows(Path(results_dir) / "metrics.csv", rows)
+    append_rows(_table_path(results_dir, "metrics.csv", group_id), rows)
 
 
-def write_config(results_dir: Path, run_id: str, config: Dict[str, Any]):
+def write_config(results_dir: Path, run_id: str, config: Dict[str, Any],
+                  group_id=None):
     """Flatten a config dict to one row per key."""
     rows = []
     for k, v in config.items():
@@ -112,11 +126,11 @@ def write_config(results_dir: Path, run_id: str, config: Dict[str, Any]):
             "key": k,
             "value": v,
         })
-    append_rows(Path(results_dir) / "config.csv", rows)
+    append_rows(_table_path(results_dir, "config.csv", group_id), rows)
 
 
 def write_timing(results_dir: Path, run_id: str,
-                  timings: Dict[str, float]):
+                  timings: Dict[str, float], group_id=None):
     """One row per timing stage."""
     rows = []
     for stage, seconds in timings.items():
@@ -125,17 +139,20 @@ def write_timing(results_dir: Path, run_id: str,
             "stage": stage,
             "seconds": seconds,
         })
-    append_rows(Path(results_dir) / "timing.csv", rows)
+    append_rows(_table_path(results_dir, "timing.csv", group_id), rows)
 
 
-def write_stack_info(results_dir: Path, info: Dict[str, Any]):
+def write_stack_info(results_dir: Path, info: Dict[str, Any],
+                      group_id=None):
     """One row per input stack (name, shape, dtype, range, etc)."""
-    append_row(Path(results_dir) / "stacks.csv", info)
+    append_row(_table_path(results_dir, "stacks.csv", group_id), info)
 
 
-def write_algo_registry(results_dir: Path, rows: List[Dict[str, Any]]):
+def write_algo_registry(results_dir: Path, rows: List[Dict[str, Any]],
+                         group_id=None):
     """One row per algorithm. Called once at benchmark start."""
-    path = Path(results_dir) / "algos.csv"
+    path = _table_path(results_dir, "algos.csv", group_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
     # Overwrite if it exists — algos registry is canonical, not append.
     if path.exists():
         path.unlink()
@@ -144,18 +161,68 @@ def write_algo_registry(results_dir: Path, rows: List[Dict[str, Any]]):
 
 # ── Read helpers ───────────────────────────────────────────────
 
-def read_runs(results_dir: Path) -> List[Dict[str, Any]]:
-    path = Path(results_dir) / "runs.csv"
-    if not path.exists():
-        return []
-    with open(path, "r", newline="") as f:
-        return list(csv.DictReader(f))
+def read_runs(results_dir: Path, group_id=None) -> List[Dict[str, Any]]:
+    """
+    Read runs.csv. If group_id is None, scans every subdirectory under
+    `results_dir` for runs.csv files and merges them (with a `group_id`
+    column added if missing). This is what lets `completed_pairs` work
+    across all groups, so reruns skip prior work regardless of which
+    group it lived under.
+    """
+    if group_id is not None:
+        path = Path(results_dir) / group_id / "runs.csv"
+        if not path.exists():
+            return []
+        with open(path, "r", newline="") as f:
+            rows = list(csv.DictReader(f))
+        for r in rows:
+            r.setdefault("group_id", group_id)
+        return rows
+
+    # Scan all groups
+    rows_all = []
+    rd = Path(results_dir)
+    if not rd.exists():
+        return rows_all
+    # Legacy top-level runs.csv (pre-grouping)
+    legacy = rd / "runs.csv"
+    if legacy.exists():
+        with open(legacy, "r", newline="") as f:
+            for r in csv.DictReader(f):
+                r.setdefault("group_id", "")
+                rows_all.append(r)
+    # Group-scoped runs.csv files
+    for sub in sorted(rd.iterdir()):
+        if not sub.is_dir():
+            continue
+        rp = sub / "runs.csv"
+        if not rp.exists():
+            continue
+        with open(rp, "r", newline="") as f:
+            for r in csv.DictReader(f):
+                r.setdefault("group_id", sub.name)
+                rows_all.append(r)
+    return rows_all
 
 
 def completed_pairs(results_dir: Path):
-    """Return set of (algo, stack_name) pairs that already succeeded."""
+    """Return set of (algo, stack_name) pairs that succeeded in ANY group."""
     done = set()
     for row in read_runs(results_dir):
         if row.get("status", "").lower() == "success":
             done.add((row["algo"], row["stack_name"]))
     return done
+
+
+def list_groups(results_dir: Path) -> List[str]:
+    """Return all group_ids present under `results_dir`."""
+    rd = Path(results_dir)
+    if not rd.exists():
+        return []
+    groups = []
+    for sub in sorted(rd.iterdir()):
+        if not sub.is_dir():
+            continue
+        if (sub / "runs.csv").exists():
+            groups.append(sub.name)
+    return groups

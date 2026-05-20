@@ -16,18 +16,22 @@ DL_2026/
 │   ├── swin_unet3d.py
 │   ├── fm2s_dvt.py
 │   ├── fm2s_classic.py      # adapter around _fm2s_paper.py
-│   └── _fm2s_paper.py       # original fm2s.py, verbatim
+│   ├── n2v_3d_chhayansh.py
+│   ├── _fm2s_paper.py       # original fm2s.py, verbatim
+│   └── _weights/n2v_3d_chhayansh.pth   # shipped pretrained weights
 │
 ├── configs/                  # One YAML-like .py per (algo, preset)
 │   ├── n2v_unet3d_default.py
-│   ├── dvt_unet3d_t4.py
-│   ├── ...
+│   ├── dvt_unet3d_t4.py     # ⭐ proven best config
+│   ├── dvt_unet3d_default.py # alias of t4 (single source of truth)
+│   └── ...
 │
 ├── runner/                   # The framework — algo-agnostic
-│   ├── io.py                # TIFF loading, dataset discovery
-│   ├── csv_db.py            # Multi-CSV "database" writes
+│   ├── io.py                # TIFF + group-folder helpers, manifest writer
+│   ├── csv_db.py            # Group-scoped multi-CSV "database"
 │   ├── runtime_log.py       # GPU/CPU sampling, stage timer
 │   ├── eval_runner.py       # Metric computation (calls existing eval.py)
+│   ├── preprocessing.py     # Pluggable normalization + temporal-target
 │   ├── plots.py             # Paper figures
 │   ├── core.py              # run_one(...) — top-level entry
 │   └── _eval_metrics.py     # original eval.py, verbatim
@@ -39,21 +43,41 @@ DL_2026/
 │   └── make_paper_figures.py
 │
 ├── benchmark_results/        # Auto-created; never edit by hand
-│   ├── runs.csv             # ⭐ master table, one row per run
-│   ├── metrics.csv          # one row per (run_id, metric)
-│   ├── config.csv           # one row per (run_id, config_key)
-│   ├── timing.csv           # per-stage durations
-│   ├── gpu_log.csv          # ~1 sample / 2 seconds during the run
-│   ├── stacks.csv           # one row per loaded stack
-│   ├── algos.csv            # registry snapshot
-│   ├── outputs/<run_id>/    # denoised .tif files
-│   ├── checkpoints/<run_id>/
-│   └── errors/<run_id>.log  # full traceback on failure
+│   └── <group_id>/                   # ⭐ One folder per benchmark invocation
+│       ├── group_manifest.json       # human-readable per-algo config snapshot
+│       ├── runs.csv                  # master table (incl. group_id + config_name)
+│       ├── metrics.csv
+│       ├── config.csv
+│       ├── timing.csv
+│       ├── gpu_log.csv
+│       ├── stacks.csv
+│       ├── algos.csv
+│       ├── outputs/<run_id>/<stack>.tif
+│       ├── checkpoints/<run_id>/
+│       └── errors/<run_id>.log
 │
 └── paper_figures/            # Auto-created
-    ├── <run_id>/<stack>_frame0750.png   # 1×4 grids
-    └── _leaderboard/<metric>.png        # bar charts
+    └── <group_id>/                   # ⭐ Per-group figures
+        ├── group_manifest.json       # mirror of the results-side manifest
+        ├── <run_id>/<stack>_frame0750.png
+        └── _leaderboard/<metric>.png
 ```
+
+## Group IDs — what they are and why
+
+Every `benchmark.py` invocation gets one **group_id** like `g_20260519-175306_a1b2c3`. All algos that ran together in that invocation share it. Their outputs all land under `benchmark_results/<group_id>/`. So when you write the paper later, you can look at `group_manifest.json` and see:
+
+- which algos ran in that benchmark
+- what config each one used (full dump)
+- when it started and completed
+- host / GPU / library versions
+- success/failure counts
+
+If you want to **add a single algo to an existing benchmark group** (e.g. someone asks you to also run X with config Y for comparison), pass `--group-id <existing>` to `run_one.py` and it'll append to that group's CSVs and manifest.
+
+`scripts/benchmark.py` is safe to interrupt and re-run — completed (algo, stack) pairs are **skipped across all groups**, so reruns avoid duplicating work even if you started a new group.
+
+`scripts/make_paper_figures.py` scans all groups by default (one leaderboard per group) but `--group-id <gid>` restricts it to one group.
 
 ## Quickstart
 
@@ -86,8 +110,8 @@ This single command produces:
 
 ```bash
 python scripts/benchmark.py \
-    --noisy-dir data/test \
-    --clean-dir data/gt \
+    --noisy-dir /path/to/noisy \
+    --clean-dir /path/to/clean \
     --algos all
 ```
 
@@ -133,6 +157,10 @@ joined[(joined.metric == "stSNR") & (joined.stack_name == "F1")] \
 1. Drop a Python module into `algos/your_algo.py` exposing this API:
 
    ```python
+   # Declare default preprocessing strategies (REQUIRED for new algos)
+   DEFAULT_NORMALIZATION   = "framework_default"   # see runner/preprocessing.py
+   DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
    def compute_norm_params(stack): ...
    def normalize(stack, params): ...
    def denormalize(stack, params): ...
@@ -165,6 +193,80 @@ joined[(joined.metric == "stSNR") & (joined.stack_name == "F1")] \
    ```
 
 That's it — `scripts/benchmark.py` will pick it up automatically next time.
+
+## Pluggable preprocessing (normalization + temporal target)
+
+Both **normalization** and the **temporal-target / reference frame** computation are pluggable strategies, selectable per-run via the config dict.
+
+### Selecting a strategy
+
+```python
+CONFIG = {
+    "algo": "dvt_unet3d",
+    # default per-algo if absent — override if you want different behavior
+    "normalization":   "p0.5_p99.5",       # or "chhayansh", "p3_p97", "minmax", "noop", ...
+    "temporal_target": "temporal_median_2d",  # or "temporal_mean_2d", "per_frame_median_3d", ...
+    ...
+}
+```
+
+### Available normalization strategies (`runner/preprocessing.py`)
+
+| Name | What it does |
+|---|---|
+| `framework_default` | p0.5–p99.5 percentile on 300 sampled frames (most algos) |
+| `p0.5_p99.5` | Synonym of `framework_default` |
+| `p1_p99` | p1–p99 percentile |
+| `p3_p97` | p3–p97 percentile on 300 sampled frames (n2v_unet3d default) |
+| `chhayansh` | p3–p97 on FULL volume (matches upstream `chhayansh` repo) |
+| `p3_p97_fullvol` | Synonym of `chhayansh` |
+| `minmax` | Naive min/max scaling |
+| `meanstd` | Zero-mean unit-std z-score |
+| `noop` | Pass-through (no scaling; FM2S handles it internally) |
+
+### Available temporal-target strategies
+
+| Name | Returns | What it does |
+|---|---|---|
+| `framework_default` | 2D | Subsampled per-pixel temporal median (most algos) |
+| `temporal_median_2d` | 2D | Synonym of `framework_default` |
+| `temporal_mean_2d` | 2D | Subsampled per-pixel temporal mean — cheaper |
+| `full_stack_median_2d` | 2D | Exact median over all frames (no subsampling) |
+| `per_frame_median_3d` | 3D | Sliding-window median: each output frame has its OWN local median |
+
+Strategies returning a 3D volume are automatically collapsed to 2D by the algos that expect a 2D target.
+
+### Per-algo defaults
+
+Each algo declares its default at module level. The framework's `run_one` reads these as the fallback when config doesn't specify an override:
+
+| Algo | Default normalization | Default temporal target |
+|---|---|---|
+| `n2v_unet3d` | `p3_p97` | `temporal_median_2d` |
+| `n2v_unet3d_biasfree` | `p3_p97` | `temporal_median_2d` |
+| `dvt_unet3d` | `p0.5_p99.5` | `temporal_median_2d` |
+| `restormer3d` | `p0.5_p99.5` | `temporal_median_2d` |
+| `restormer3d_v2` | `p0.5_p99.5` | `temporal_median_2d` |
+| `swin_unet3d` | `p0.5_p99.5` | `temporal_median_2d` |
+| `fm2s_dvt` | `p0.5_p99.5` | `temporal_median_2d` |
+| `fm2s_classic` | `noop` | `temporal_median_2d` |
+| `n2v_3d_chhayansh` | `chhayansh` | `temporal_median_2d` |
+
+### Adding a new strategy at runtime
+
+```python
+from runner import preprocessing as prep
+class MyNorm(prep.NormalizationStrategy):
+    name = "my_norm"
+    def compute_params(self, stack):
+        return {"shift": 0.0, "scale": float(stack.std()), "strategy": "my_norm"}
+prep.register_normalization(MyNorm())
+
+# Now use it from any config:
+CONFIG["normalization"] = "my_norm"
+```
+
+The resolved strategy name is recorded in `runs.csv` (column `__resolved_normalization` / `__resolved_temporal_target`) and in `config.csv` for full traceability.
 
 ## Notes for the paper
 

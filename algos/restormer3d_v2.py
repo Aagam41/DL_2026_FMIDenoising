@@ -64,23 +64,26 @@ from torch.cuda.amp import autocast, GradScaler
 # NORMALIZATION
 # ══════════════════════════════════════════════════════════════
 
+from runner import preprocessing as _prep
+
+DEFAULT_NORMALIZATION = "p0.5_p99.5"
+DEFAULT_TEMPORAL_TARGET = "temporal_median_2d"
+
+
+def _default_norm():
+    return _prep.resolve_normalization(DEFAULT_NORMALIZATION)
+
+
 def compute_norm_params(stack: np.ndarray) -> dict:
-    """Robust percentile-based normalization parameters (p0.5-p99.5)."""
-    n = min(300, stack.shape[0])
-    idx = np.linspace(0, stack.shape[0] - 1, n, dtype=int)
-    sampled = stack[idx].astype(np.float64)
-    p_lo = float(np.percentile(sampled, 0.5))
-    p_hi = float(np.percentile(sampled, 99.5))
-    scale = max(p_hi - p_lo, 1e-6)
-    return {"shift": p_lo, "scale": scale}
+    return _default_norm().compute_params(stack)
 
 
 def normalize(data, params):
-    return (data.astype(np.float32) - params["shift"]) / params["scale"]
+    return _default_norm().forward(data, params)
 
 
 def denormalize(data, params):
-    return data.astype(np.float32) * params["scale"] + params["shift"]
+    return _default_norm().inverse(data, params)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -463,17 +466,31 @@ class EMA:
 # TEMPORAL/SPATIAL PRIORS
 # ══════════════════════════════════════════════════════════════
 
-def compute_priors(stack_norm: np.ndarray, max_frames: int = 500):
+def compute_priors(stack_norm: np.ndarray, max_frames: int = 500,
+                    tt_strategy=None):
     """
     Compute per-pixel temporal median and std priors.
     stack_norm: [F, H, W] normalized.
     Returns (median_2d, std_2d) both [H, W] float32.
+
+    The median uses the temporal-target strategy if `tt_strategy` is
+    given; otherwise falls back to subsampled median (the original
+    behavior). Std is always computed locally — it's a prior, not a
+    "target".
     """
     F_total = stack_norm.shape[0]
     n = min(max_frames, F_total)
     idx = np.linspace(0, F_total - 1, n, dtype=int)
     sub = stack_norm[idx]
-    med = np.median(sub, axis=0).astype(np.float32)
+    # Median via strategy if given, else original subsampled median
+    if tt_strategy is None:
+        med = np.median(sub, axis=0).astype(np.float32)
+    else:
+        med_arr = tt_strategy.compute(stack_norm)
+        if tt_strategy.returns != "2d":
+            med = np.median(med_arr, axis=0).astype(np.float32)
+        else:
+            med = med_arr
     std = sub.std(axis=0).astype(np.float32)
     # Robust normalize std to [0, 1] for stable input
     std = std / max(float(np.percentile(std, 99)), 1e-6)
@@ -561,19 +578,27 @@ def train_self_supervised(
         print(f" EMA decay: {cfg['ema_decay']}")
         print(f" Mixed precision (fp16): {use_amp}")
 
-    # ── Normalize ─────────────────────────────────────────────
-    norm_params = compute_norm_params(stack)
+    # ── Normalize (strategy from config) ──────────────────────
+    norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
+    norm_strategy = _prep.resolve_normalization(norm_name)
+    norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
-    stack_norm = normalize(stack, norm_params)
+    cfg["__resolved_normalization"] = norm_strategy.name
+    stack_norm = norm_strategy.forward(stack, norm_params)
     if verbose:
-        print(f" Norm: shift={norm_params['shift']:.2f}, "
+        print(f" Norm [{norm_strategy.name}]: "
+              f"shift={norm_params['shift']:.2f}, "
               f"scale={norm_params['scale']:.2f}")
 
-    # ── Compute priors ────────────────────────────────────────
-    median_2d, std_2d = compute_priors(stack_norm)
+    # ── Compute priors (median via temporal-target strategy) ───
+    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
+    tt_strategy = _prep.resolve_temporal_target(tt_name)
+    cfg["__resolved_temporal_target"] = tt_strategy.name
+    median_2d, std_2d = compute_priors(stack_norm, tt_strategy=tt_strategy)
     cfg["median_2d_min_max"] = (float(median_2d.min()), float(median_2d.max()))
     if verbose:
-        print(f" Median prior: [{median_2d.min():.3f}, {median_2d.max():.3f}]")
+        print(f" Median prior [{tt_strategy.name}]: "
+              f"[{median_2d.min():.3f}, {median_2d.max():.3f}]")
         print(f" Std prior:    [{std_2d.min():.3f}, {std_2d.max():.3f}]")
 
     # Move to GPU
@@ -860,13 +885,22 @@ def denoise_stack(
               f"stride={stride_d}x{stride_hw}x{stride_hw}, "
               f"TTA={'on' if use_tta else 'off'}({tta_n}x)")
 
-    stack_norm = normalize(stack, norm_params)
+    norm_strategy = _prep.resolve_normalization(
+        config.get("__resolved_normalization",
+                    config.get("normalization", DEFAULT_NORMALIZATION))
+    )
+    stack_norm = norm_strategy.forward(stack, norm_params)
 
-    # Recompute priors from the input (same as during training)
+    # Recompute priors from the input (same as during training).
+    # If a temporal-target strategy was used during training, reuse it.
+    tt_name = config.get("__resolved_temporal_target",
+                          config.get("temporal_target",
+                                      DEFAULT_TEMPORAL_TARGET))
+    tt_strategy = _prep.resolve_temporal_target(tt_name)
     median_2d = config.get("_priors_med")
     std_2d    = config.get("_priors_std")
     if median_2d is None or std_2d is None:
-        median_2d, std_2d = compute_priors(stack_norm)
+        median_2d, std_2d = compute_priors(stack_norm, tt_strategy=tt_strategy)
 
     stack_t  = torch.from_numpy(stack_norm).float().to(device)
     median_t = torch.from_numpy(median_2d).float().to(device)
@@ -949,7 +983,7 @@ def denoise_stack(
 
     output = output_sum / weight_sum.clamp(min=1e-8)
     output = output.cpu().numpy()
-    output = denormalize(output, norm_params)
+    output = norm_strategy.inverse(output, norm_params)
 
     output = np.nan_to_num(
         output,

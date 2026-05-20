@@ -38,6 +38,9 @@ def main():
                     help="Directory with clean GT .tif stacks.")
     p.add_argument("--results-dir",
                     default=str(ROOT / "benchmark_results"))
+    p.add_argument("--group-id", default=None,
+                    help="Restrict re-evaluation to a single group_id. "
+                         "Default: all groups.")
     p.add_argument("--runs", nargs="*", default=None,
                     help="Specific run_ids to re-evaluate. Default: all "
                          "successful runs in runs.csv.")
@@ -46,7 +49,7 @@ def main():
     results_dir = Path(args.results_dir)
     clean_dir   = Path(args.clean_dir)
 
-    rows = csv_db.read_runs(results_dir)
+    rows = csv_db.read_runs(results_dir, group_id=args.group_id)
     if args.runs:
         wanted = set(args.runs)
         rows = [r for r in rows if r["run_id"] in wanted]
@@ -58,9 +61,12 @@ def main():
         return 0
 
     print(f"Re-evaluating {len(rows)} run(s) against clean dir: {clean_dir}")
+    if args.group_id:
+        print(f"Scoped to group: {args.group_id}")
 
     for i, row in enumerate(rows, 1):
         run_id = row["run_id"]; stack = row["stack_name"]
+        group_id = row.get("group_id", "")
         out_path = Path(row.get("output_path", ""))
         if not out_path.exists():
             print(f"[{i}/{len(rows)}] {run_id} — output missing, skip")
@@ -70,7 +76,8 @@ def main():
             print(f"[{i}/{len(rows)}] {run_id} — no clean for {stack}, skip")
             continue
         clean_path = clean_candidates[0]
-        print(f"[{i}/{len(rows)}] {run_id}  vs  {clean_path.name}")
+        print(f"[{i}/{len(rows)}] {run_id} (group {group_id})  "
+              f"vs  {clean_path.name}")
 
         try:
             denoised = io_.load_stack(out_path)
@@ -80,10 +87,16 @@ def main():
             print(f"  ERROR: {e}")
             continue
 
-        csv_db.write_metrics(results_dir, run_id, metrics)
-        csv_db.append_row(results_dir / "eval_only.csv", {
+        # Write metrics under whatever group the run came from
+        write_group = group_id if group_id else None
+        csv_db.write_metrics(results_dir, run_id, metrics,
+                              group_id=write_group)
+        eval_path = (results_dir / group_id / "eval_only.csv"
+                      if group_id else results_dir / "eval_only.csv")
+        csv_db.append_row(eval_path, {
             "evaluated_at": datetime.now(timezone.utc).isoformat(),
             "run_id":       run_id,
+            "group_id":     group_id,
             "stack_name":   stack,
             "clean_path":   str(clean_path),
             "stSNR":        metrics.get("stSNR", ""),

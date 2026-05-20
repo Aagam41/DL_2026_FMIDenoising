@@ -24,6 +24,7 @@ benchmark_results/ tree with CSVs and per-run TIFF/PNG outputs.
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +37,19 @@ from runner.io import find_stacks
 from runner.csv_db import (
     completed_pairs, write_algo_registry,
 )
+
+
+def _serializable(d):
+    """Best-effort JSON-friendly version of a config dict."""
+    if d is None:
+        return None
+    if isinstance(d, (str, int, float, bool)):
+        return d
+    if isinstance(d, (list, tuple)):
+        return [_serializable(x) for x in d]
+    if isinstance(d, dict):
+        return {k: _serializable(v) for k, v in d.items()}
+    return str(d)
 
 
 def _resolve_config_for_algo(algo: str, config_paths) -> Path:
@@ -80,6 +94,10 @@ def main():
                          "configs/<algo>_default.py.")
     p.add_argument("--results-dir", default=str(ROOT / "benchmark_results"))
     p.add_argument("--figures-dir", default=str(ROOT / "paper_figures"))
+    p.add_argument("--group-id", default=None,
+                    help="Group ID for output scoping. If omitted, a fresh "
+                         "one is generated. Pass an existing group_id to "
+                         "append to a prior benchmark group.")
     p.add_argument("--frame", type=int, default=None,
                     help="Override paper_frame from config.")
     p.add_argument("--no-checkpoint", action="store_true")
@@ -92,6 +110,16 @@ def main():
     figures_dir = Path(args.figures_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Group ID: one per benchmark invocation ─────────────────
+    # Every algo+stack run in this invocation gets the same group_id so
+    # they land in <results_dir>/<group_id>/ together. If the user
+    # passed --group-id, append to that group instead.
+    from runner import io as io_
+    group_id = args.group_id or io_.make_group_id()
+    (results_dir / group_id).mkdir(parents=True, exist_ok=True)
+    (figures_dir / group_id).mkdir(parents=True, exist_ok=True)
+    print(f"\nGroup ID for this benchmark: {group_id}")
+
     # Resolve algos
     if "all" in args.algos:
         algo_names = sorted(_algos_pkg.REGISTRY.keys())
@@ -102,8 +130,9 @@ def main():
                 sys.exit(f"Unknown algo: {a}. "
                          f"Known: {sorted(_algos_pkg.REGISTRY.keys())}")
 
-    # Write the registry snapshot to algos.csv (overwrites)
-    write_algo_registry(results_dir, _algos_pkg.list_algos())
+    # Write the registry snapshot to algos.csv (group-scoped)
+    write_algo_registry(results_dir, _algos_pkg.list_algos(),
+                         group_id=group_id)
 
     # Resolve configs per algo
     resolved_cfgs = {}
@@ -118,7 +147,7 @@ def main():
     if not pairs:
         sys.exit(f"No .tif files found under {args.noisy_dir}.")
 
-    # Build the job list, filtering already-done
+    # Build the job list, filtering already-done (across ALL groups)
     done = completed_pairs(results_dir)
     jobs = []
     for stack_name, noisy_path, clean_path in pairs:
@@ -134,9 +163,9 @@ def main():
     print(f"  algos     : {len(resolved_cfgs)} ({list(resolved_cfgs.keys())})")
     print(f"  stacks    : {len(pairs)}")
     print(f"  jobs      : {len(jobs)} new "
-          f"({len(done)} already completed)")
-    print(f"  results   : {results_dir}")
-    print(f"  figures   : {figures_dir}")
+          f"({len(done)} already completed across all groups)")
+    print(f"  results   : {results_dir / group_id}")
+    print(f"  figures   : {figures_dir / group_id}")
 
     if args.dry_run or len(jobs) == 0:
         for i, (algo, stack, noisy, clean, cfg_path) in enumerate(jobs, 1):
@@ -144,23 +173,66 @@ def main():
                   f"({cfg_path.name})")
         return 0
 
+    # ── Build the group manifest BEFORE running any jobs ──────
+    # We snapshot every algo's resolved config up front so the manifest
+    # is useful even if a later job crashes. After all jobs complete we
+    # update completed_at + summary fields.
+    from runner import runtime_log as _rtl
+    env_info = _rtl.env_info()
+    manifest = {
+        "group_id":      group_id,
+        "started_at":    datetime.now(timezone.utc).isoformat(),
+        "host":          env_info.get("host", ""),
+        "python":        env_info.get("python", ""),
+        "torch":         env_info.get("torch", ""),
+        "gpu_name":      env_info.get("gpu_name", ""),
+        "noisy_dir":     str(args.noisy_dir),
+        "clean_dir":     str(args.clean_dir) if args.clean_dir else "",
+        "stacks":        [name for name, _, _ in pairs],
+        "configs":       {},
+        "total_jobs":    len(jobs),
+    }
+    for algo, cfg_path in resolved_cfgs.items():
+        try:
+            cfg_snapshot = load_config(cfg_path)
+        except Exception as e:
+            cfg_snapshot = {"_load_error": str(e)}
+        cn = Path(cfg_path).stem
+        manifest["configs"][f"{algo}__{cn}"] = {
+            "algo":        algo,
+            "config_name": cn,
+            "config_path": str(Path(cfg_path).resolve()),
+            "full_config": _serializable(cfg_snapshot),
+        }
+    io_.write_group_manifest(
+        results_dir=results_dir, group_id=group_id,
+        manifest=manifest, figures_dir=figures_dir,
+    )
+
     # Execute
+    successes = 0; failures = 0
     for i, (algo, stack, noisy, clean, cfg_path) in enumerate(jobs, 1):
-        print(f"\n[{i}/{len(jobs)}] {algo}  on  {stack}")
+        print(f"\n[{i}/{len(jobs)}] {algo}  on  {stack}  (group={group_id})")
         cfg = load_config(cfg_path)
         cfg.pop("algo")
         paper_frame = args.frame or cfg.pop("paper_frame", 750)
         cfg.pop("name", None); cfg.pop("description", None)
+        config_name = Path(cfg_path).stem
         try:
-            run_one(
+            summary = run_one(
                 algo=algo, config=cfg,
                 noisy_path=noisy, clean_path=clean,
                 results_dir=results_dir, figures_dir=figures_dir,
+                group_id=group_id, config_name=config_name,
                 paper_frame=paper_frame,
                 save_checkpoint=not args.no_checkpoint,
                 save_figures=not args.no_figures,
                 verbose=True,
             )
+            if summary.get("status") == "success":
+                successes += 1
+            else:
+                failures += 1
         except KeyboardInterrupt:
             print("\nInterrupted by user.")
             return 130
@@ -169,7 +241,19 @@ def main():
             # run_one already logs errors; continue to next job
             continue
 
-    print(f"\n{'='*70}\nBenchmark complete: {len(jobs)} job(s) executed.")
+    # ── Update manifest with completion summary ────────────────
+    manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
+    manifest["successes"]    = successes
+    manifest["failures"]     = failures
+    io_.write_group_manifest(
+        results_dir=results_dir, group_id=group_id,
+        manifest=manifest, figures_dir=figures_dir,
+    )
+
+    print(f"\n{'='*70}\nBenchmark complete: {len(jobs)} job(s) executed "
+          f"({successes} success, {failures} failed).")
+    print(f"Group: {group_id}")
+    print(f"Manifest: {results_dir / group_id / 'group_manifest.json'}")
     print(f"{'='*70}")
     return 0
 
