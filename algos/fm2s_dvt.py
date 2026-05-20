@@ -31,15 +31,13 @@ The per-pixel temporal attention is what makes this efficient: each
 spatial location (y, x) runs its own T-token sequence through the ViT,
 sharing weights but not state. Complexity is O(H·W · T²·d) instead of
 the O((H·W·T)²·d) of full 3D attention. With H=W=64, T=11, d=24 this
-is roughly 50 MFLOPs per patch — fast on T4.
+is roughly 50 MFLOPs per patch.
 
 Training (per-stack, zero-shot):
     Stage 0: Train FM2S CNN alone (synthesized noise → temporal median)
     Stage 1: Freeze FM2S. Train Temporal ViT to minimize
                  L1( spatial_pred + α·temp_correction,  temporal_median )
              + temporal-N2V mask loss on the noisy input.
-
-Budget: ~10 min/stack on T4. Fits 7 stacks in 1 hour with margin.
 
 API parity with model.py / model_dvt.py:
     compute_norm_params, normalize, denormalize
@@ -55,7 +53,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 
 
 # ══════════════════════════════════════════════════════════════
@@ -494,7 +491,6 @@ def train_self_supervised(stack, device, config=None, verbose=True):
     T_window = cfg["T_window"]
     phw = cfg["patch_hw"]
     bs = cfg["batch_size"]
-    use_amp = (device.type == "cuda")
 
     if verbose:
         print(f" Stack: {stack.shape}, device: {device}")
@@ -503,7 +499,7 @@ def train_self_supervised(stack, device, config=None, verbose=True):
               f"heads={cfg['vit_heads']}, blocks={cfg['vit_blocks']}")
         print(f" Patch (H,W)={phw}, batch={bs}")
         print(f" Schedule: fm2s={cfg['fm2s_iters']}, vit={cfg['vit_iters']}")
-        print(f" Mixed precision (fp16): {use_amp}")
+        print(f" Precision: fp32")
 
     # ── Normalize (strategy from config) ──────────────────────
     norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
@@ -561,7 +557,6 @@ def train_self_supervised(stack, device, config=None, verbose=True):
                                 lr=cfg["lr_fm2s"])
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["fm2s_iters"], eta_min=cfg["lr_fm2s"] * 0.1)
-        scaler = GradScaler(enabled=use_amp)
         model.fm2s.train()
         rl = 0.0
 
@@ -583,16 +578,13 @@ def train_self_supervised(stack, device, config=None, verbose=True):
             tgt = torch.stack(patches_tgt, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model.fm2s(inp)
-                loss = F.l1_loss(pred, tgt)
+            pred = model.fm2s(inp)
+            loss = F.l1_loss(pred, tgt)
             if not torch.isfinite(loss):
                 continue
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.fm2s.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rl += loss.item()
             if verbose and (it + 1) % 200 == 0:
@@ -618,7 +610,6 @@ def train_self_supervised(stack, device, config=None, verbose=True):
         )
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["vit_iters"], eta_min=1e-6)
-        scaler = GradScaler(enabled=use_amp)
         model.tdvt.train()
         rm = rn = 0.0
 
@@ -649,31 +640,28 @@ def train_self_supervised(stack, device, config=None, verbose=True):
             tgt = torch.stack(patches_tgt, dim=0).to(device)  # [B, 1, h, w]
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)                             # [B, 1, h, w]
-                # Loss 1: match temporal median
-                loss_med = F.l1_loss(pred, tgt)
+            pred = model(inp)                             # [B, 1, h, w]
+            # Loss 1: match temporal median
+            loss_med = F.l1_loss(pred, tgt)
 
-                # Loss 2: temporal-N2V at masked positions
-                loss_n2v = torch.tensor(0.0, device=device)
-                for b, (mask_idx, orig) in enumerate(n2v_targets):
-                    if mask_idx is None:
-                        continue
-                    my, mx = mask_idx
-                    pred_at_mask = pred[b, 0, my, mx]
-                    loss_n2v = loss_n2v + F.l1_loss(pred_at_mask, orig)
-                loss_n2v = loss_n2v / max(bs, 1)
+            # Loss 2: temporal-N2V at masked positions
+            loss_n2v = torch.tensor(0.0, device=device)
+            for b, (mask_idx, orig) in enumerate(n2v_targets):
+                if mask_idx is None:
+                    continue
+                my, mx = mask_idx
+                pred_at_mask = pred[b, 0, my, mx]
+                loss_n2v = loss_n2v + F.l1_loss(pred_at_mask, orig)
+            loss_n2v = loss_n2v / max(bs, 1)
 
-                loss = (cfg["loss_median_weight"] * loss_med
-                       + cfg["loss_n2v_weight"]    * loss_n2v)
+            loss = (cfg["loss_median_weight"] * loss_med
+                   + cfg["loss_n2v_weight"]    * loss_n2v)
 
             if not torch.isfinite(loss):
                 continue
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.tdvt.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rm += loss_med.item()
             rn += loss_n2v.item()

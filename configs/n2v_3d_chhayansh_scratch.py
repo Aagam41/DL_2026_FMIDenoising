@@ -26,7 +26,7 @@ CONFIG = {
     "patch_hw":     128,
     "batch_size":   2,
 
-    # Schedule — short, tuned for ~6-8 min on T4
+    # Schedule
     "warmup_iters": 0,
     "n2v_iters":    2000,
     "lr":           1e-3,

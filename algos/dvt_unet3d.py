@@ -66,7 +66,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 
 # ══════════════════════════════════════════════════════════════
 # NORMALIZATION (p3–p97 robust scaling — kept identical to model.py)
@@ -268,37 +267,28 @@ class DVTBottleneck(nn.Module):
         tokens = self.patch_embed(x_pool)                              # [B,Td,Dp,Hp,Wp]
         tokens = tokens.flatten(2).transpose(1, 2)                     # [B,N,Td]
 
-        # ── Pre-denoiser ViT + DVT decomposition (FP32 enforced) ────
-        # The attention softmax (Q @ K.T / sqrt(d) → exp) is the
-        # fp16-overflow culprit. With high-magnitude inputs (e.g. when
-        # the user picks a tighter normalization like p3_p97 which
-        # produces inputs reaching ~23), Q*K reaches values whose
-        # exp() saturates fp16 and produces NaN. The conv encoder/
-        # decoder runs fp16 fine; only the transformer needs fp32.
-        # The artifact_field, denoiser_pe, and residual_predictor are
-        # all inside this block since they all touch token features.
-        with autocast(enabled=False):
-            y = tokens.float()
-            for blk in self.vit_blocks:
-                y = blk(y)
+        # ── Pre-denoiser ViT + DVT decomposition ────────────────────
+        y = tokens
+        for blk in self.vit_blocks:
+            y = blk(y)
 
-            # ── DVT decomposition (Eq. 10 in the paper) ────────────
-            # Subtract artifact field G (input-independent) ...
-            y_minus_g = y - self.artifact_field.float()
-            # ... add learnable post-PE for the denoiser (Tab. 6 row d) ...
-            y_for_denoiser = y_minus_g + self.denoiser_pe.float()
-            # ... and run the single-block denoiser to get the clean
-            # semantics F.
-            clean_tokens = self.denoiser_block(y_for_denoiser)
+        # ── DVT decomposition (Eq. 10 in the paper) ────────────────
+        # Subtract artifact field G (input-independent) ...
+        y_minus_g = y - self.artifact_field
+        # ... add learnable post-PE for the denoiser (Tab. 6 row d) ...
+        y_for_denoiser = y_minus_g + self.denoiser_pe
+        # ... and run the single-block denoiser to get the clean
+        # semantics F.
+        clean_tokens = self.denoiser_block(y_for_denoiser)
 
-            # Residual term ĥ = h_ψ(y). We mix a small fraction back so
-            # that signal-dependent fluctuations the denoiser shouldn't
-            # kill (e.g. genuine calcium transients) survive — the
-            # paper uses this term to *re-explain* parts of the noisy
-            # ViT output during training (Eqs. 8–10), and it acts as
-            # a controlled bypass.
-            residual = self.residual_predictor(y)
-            clean_tokens = clean_tokens + 0.05 * residual
+        # Residual term ĥ = h_ψ(y). We mix a small fraction back so
+        # that signal-dependent fluctuations the denoiser shouldn't
+        # kill (e.g. genuine calcium transients) survive — the paper
+        # uses this term to *re-explain* parts of the noisy ViT output
+        # during training (Eqs. 8–10), and it acts as a controlled
+        # bypass.
+        residual = self.residual_predictor(y)
+        clean_tokens = clean_tokens + 0.05 * residual
 
         # ── Unpatchify ─────────────────────────────────────────────
         out = clean_tokens.transpose(1, 2).reshape(B, self.token_dim, Dp, Hp, Wp)
@@ -491,8 +481,9 @@ def train_self_supervised(
     Stage 0 — Temporal-median warmup
     Stage 1 — 3D Blind-spot (Noise2Void)
 
-    Uses fp16 mixed-precision (autocast + GradScaler) on CUDA for ~3×
-    T4 speedup vs fp32. Falls back to fp32 on CPU automatically.
+    Trains in full fp32 (no mixed precision) for numerical stability —
+    the attention softmax in the DVT bottleneck is fragile under fp16
+    on high-magnitude inputs.
 
     Args:
         stack:  [F, H, W] numpy array (raw, original values).
@@ -501,8 +492,6 @@ def train_self_supervised(
     Returns:
         (model, cfg)  — the trained DVTUNet3D and the full config used.
     """
-    from torch.cuda.amp import autocast, GradScaler
-
     t0 = time.time()
     cfg = {
         # backbone
@@ -531,14 +520,6 @@ def train_self_supervised(
     pd, phw = cfg["patch_d"], cfg["patch_hw"]
     bs = cfg["batch_size"]
 
-    # use_amp is fp16 mixed precision. Default ON for CUDA, OFF for CPU.
-    # Can be forced off via config["use_amp"]=False for full fp32 training
-    # (~3x slower on T4) if attention overflow is suspected with a custom
-    # normalization. The DVT bottleneck's transformer blocks are ALWAYS
-    # run in fp32 regardless of this flag (see DVTBottleneck.forward),
-    # so use_amp=True is generally safe.
-    use_amp = cfg.get("use_amp", device.type == "cuda")
-
     if verbose:
         n_tok = int(np.prod(cfg["grid_shape"]))
         print(f" Stack: {stack.shape}, device: {device}")
@@ -549,7 +530,7 @@ def train_self_supervised(
         print(f" Patch: {pd}×{phw}×{phw}, batch={bs}")
         print(f" Stages: warmup={cfg['warmup_iters']}, "
               f"n2v={cfg['n2v_iters']}")
-        print(f" Mixed precision (fp16): {use_amp}")
+        print(f" Precision: fp32")
 
     # ── Normalize (strategy from config) ────────────────
     norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
@@ -617,7 +598,6 @@ def train_self_supervised(
             opt, cfg["warmup_iters"], eta_min=cfg["lr"] * 0.1,
         )
         crit = nn.MSELoss()
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
 
@@ -637,15 +617,12 @@ def train_self_supervised(
             tgt = torch.stack(targets, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)
-                loss = crit(pred, tgt)
+            pred = model(inp)
+            loss = crit(pred, tgt)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rl += loss.item()
 
@@ -665,14 +642,13 @@ def train_self_supervised(
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["n2v_iters"], eta_min=1e-6,
         )
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
-        # NaN guard: snapshot weights periodically. If loss goes NaN
-        # (typically from fp16 overflow on outlier patches), restore
-        # the last known-good weights and reduce LR for this step. We
-        # also count consecutive NaN steps and abort with a clear
-        # message if the network is stuck.
+        # NaN guard: snapshot weights periodically. With fp32 training
+        # this rarely fires, but keeps the framework safe against any
+        # divergence cause (extreme outlier patches, bad lr/schedule,
+        # custom user-supplied normalization that produces very large
+        # inputs, etc.). Cheap to keep, important when it matters.
         nan_consecutive = 0
         nan_total = 0
         last_good_state = None
@@ -697,24 +673,18 @@ def train_self_supervised(
             inp = torch.stack(patches, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)
-                loss = torch.tensor(0.0, device=device)
-                for b, (mz, my, mx, orig) in enumerate(all_orig):
-                    pred_at_mask = pred[b, 0, mz, my, mx]
-                    loss = loss + F.mse_loss(pred_at_mask, orig)
-                loss = loss / bs
+            pred = model(inp)
+            loss = torch.tensor(0.0, device=device)
+            for b, (mz, my, mx, orig) in enumerate(all_orig):
+                pred_at_mask = pred[b, 0, mz, my, mx]
+                loss = loss + F.mse_loss(pred_at_mask, orig)
+            loss = loss / bs
 
             # ── NaN guard ────────────────────────────────────────
             loss_is_bad = (not torch.isfinite(loss)) or torch.isnan(loss)
             if loss_is_bad:
                 nan_consecutive += 1
                 nan_total += 1
-                # Skip the gradient update — leave weights where they are.
-                # scaler.update() is required to keep the scaler healthy
-                # since we already called scaler.scale(...) above (we
-                # didn't actually, when loss is NaN we skip the whole
-                # backward). Reset gradients explicitly:
                 opt.zero_grad(set_to_none=True)
                 if nan_consecutive == 1 and verbose:
                     print(f"   NaN at iter {it+1} — skipping update "
@@ -728,17 +698,14 @@ def train_self_supervised(
                 if nan_consecutive >= max_consecutive_nan:
                     if verbose:
                         print(f"   ABORTING N2V — {nan_consecutive} "
-                              f"consecutive NaN steps. Likely fp16 "
-                              f"overflow. Try a tighter normalization "
-                              f"(e.g. 'p0.5_p99.5'), lower lr, or "
-                              f"disable AMP.")
+                              f"consecutive NaN steps. Try a tighter "
+                              f"normalization (e.g. 'p0.5_p99.5') or "
+                              f"a lower lr.")
                     break
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            # Skip step if gradients themselves are non-finite — also
-            # protects against silent NaN propagation.
+            loss.backward()
+            # Skip step if gradients themselves are non-finite
             grad_ok = True
             for p in model.parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -748,12 +715,10 @@ def train_self_supervised(
                 nan_consecutive += 1
                 nan_total += 1
                 opt.zero_grad(set_to_none=True)
-                scaler.update()
                 continue
 
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rl += loss.item()
             nan_consecutive = 0
@@ -876,12 +841,8 @@ def denoise_stack(
                         mode="reflect",
                     )
                 inp = patch.unsqueeze(0).unsqueeze(0)
-                
-                # pred = model(inp).squeeze(0).squeeze(0)
-                with autocast(dtype=torch.float16):
-                    pred = model(inp).squeeze(0).squeeze(0)
-                pred = pred.float()  # cast back before accumulation
-                
+                pred = model(inp).squeeze(0).squeeze(0)
+
                 pred = pred[:ad, :ah, :aw]
                 win  = gauss_win[:ad, :ah, :aw]
 
@@ -901,12 +862,12 @@ def denoise_stack(
     output = output.cpu().numpy()
 
     # ── Catastrophic-failure guard ───────────────────────────
-    # If the model was wiped to NaN during training (e.g. fp16
-    # attention overflow on outlier patches), the inference output will
-    # be all-NaN. Detect this and fall back to the noisy input rather
-    # than silently writing a black TIFF that the user then has to
-    # diagnose. This will hurt metrics but produces a usable file and
-    # a clear warning instead of zeros.
+    # If the model was wiped to NaN during training (e.g. divergence on
+    # outlier patches with an unsafe normalization choice), the inference
+    # output will be all-NaN. Detect this and fall back to the noisy
+    # input rather than silently writing a black TIFF that the user
+    # then has to diagnose. This will hurt metrics but produces a
+    # usable file and a clear warning instead of zeros.
     n_bad = int((~np.isfinite(output)).sum())
     total_voxels = output.size
     bad_frac = n_bad / max(total_voxels, 1)

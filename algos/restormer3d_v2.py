@@ -57,7 +57,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 
 
 # ══════════════════════════════════════════════════════════════
@@ -561,7 +560,6 @@ def train_self_supervised(
     F_total, H, W = stack.shape
     pd, phw = cfg["patch_d"], cfg["patch_hw"]
     bs = cfg["batch_size"]
-    use_amp = (device.type == "cuda")
 
     if verbose:
         print(f" Stack: {stack.shape}, device: {device}")
@@ -576,7 +574,7 @@ def train_self_supervised(
               f"radius_s={cfg['mask_radius_s']}, "
               f"radius_t={cfg['mask_radius_t']} (0 = spatial-only)")
         print(f" EMA decay: {cfg['ema_decay']}")
-        print(f" Mixed precision (fp16): {use_amp}")
+        print(f" Precision: fp32")
 
     # ── Normalize (strategy from config) ──────────────────────
     norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
@@ -681,7 +679,6 @@ def train_self_supervised(
                                  weight_decay=1e-4, betas=(0.9, 0.999))
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["warmup_iters"], eta_min=cfg["lr"] * 0.1)
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
 
@@ -703,19 +700,16 @@ def train_self_supervised(
             tgt = torch.stack(targets, dim=0).to(device)   # [B, 1, D, H, W]
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)
-                loss = F.l1_loss(pred, tgt)
+            pred = model(inp)
+            loss = F.l1_loss(pred, tgt)
             if not torch.isfinite(loss):
                 if verbose:
                     print(f"   WARN non-finite loss at iter {it}, skip")
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             ema.update(model)
             rl += loss.item()
@@ -737,7 +731,6 @@ def train_self_supervised(
                                  betas=(0.9, 0.999))
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["n2v_iters"], eta_min=1e-6)
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl1 = rgrad = rtgrad = 0.0
 
@@ -784,41 +777,38 @@ def train_self_supervised(
             inp_full   = torch.stack(full_inputs, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred_masked = model(inp_masked)
-                pred_full   = model(inp_full)
+            pred_masked = model(inp_masked)
+            pred_full   = model(inp_full)
 
-                # 1) N2V L1 at masked positions
-                loss_l1 = torch.tensor(0.0, device=device)
-                for b, (mz, my, mx, orig) in enumerate(all_orig):
-                    pred_at_mask = pred_masked[b, 0, mz, my, mx]
-                    loss_l1 = loss_l1 + F.l1_loss(pred_at_mask, orig)
-                loss_l1 = loss_l1 / bs
+            # 1) N2V L1 at masked positions
+            loss_l1 = torch.tensor(0.0, device=device)
+            for b, (mz, my, mx, orig) in enumerate(all_orig):
+                pred_at_mask = pred_masked[b, 0, mz, my, mx]
+                loss_l1 = loss_l1 + F.l1_loss(pred_at_mask, orig)
+            loss_l1 = loss_l1 / bs
 
-                # 2) Spatial gradient consistency (full-output only)
-                gx_p, gy_p = _spatial_grad_3d(pred_full)
-                gx_i, gy_i = _spatial_grad_3d(inp_full[:, 0:1])  # noisy ch
-                loss_grad = F.l1_loss(gx_p, gx_i) + F.l1_loss(gy_p, gy_i)
+            # 2) Spatial gradient consistency (full-output only)
+            gx_p, gy_p = _spatial_grad_3d(pred_full)
+            gx_i, gy_i = _spatial_grad_3d(inp_full[:, 0:1])  # noisy ch
+            loss_grad = F.l1_loss(gx_p, gx_i) + F.l1_loss(gy_p, gy_i)
 
-                # 3) Temporal gradient consistency
-                tg_p = _temporal_grad_3d(pred_full)
-                tg_i = _temporal_grad_3d(inp_full[:, 0:1])
-                loss_tgrad = F.l1_loss(tg_p, tg_i)
+            # 3) Temporal gradient consistency
+            tg_p = _temporal_grad_3d(pred_full)
+            tg_i = _temporal_grad_3d(inp_full[:, 0:1])
+            loss_tgrad = F.l1_loss(tg_p, tg_i)
 
-                loss = (cfg["loss_l1_weight"]   * loss_l1
-                       + cfg["loss_grad_weight"]  * loss_grad
-                       + cfg["loss_tgrad_weight"] * loss_tgrad)
+            loss = (cfg["loss_l1_weight"]   * loss_l1
+                   + cfg["loss_grad_weight"]  * loss_grad
+                   + cfg["loss_tgrad_weight"] * loss_tgrad)
 
             if not torch.isfinite(loss):
                 if verbose:
                     print(f"   WARN non-finite loss at iter {it}, skip")
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             ema.update(model)
 

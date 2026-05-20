@@ -38,9 +38,7 @@ Training:
   Zero-shot 3D Noise2Void with a short temporal-median warmup. L1 loss
   at masked voxels only (no gradient-consistency: pushing output
   gradients to match noisy-input gradients teaches the network to keep
-  noise, which we learned the hard way). Mixed precision (fp16) on CUDA.
-
-Budget: targets ~8 min/stack on T4 for 7 stacks/hour.
+  noise, which we learned the hard way). Full fp32 training.
 
 API parity:
   compute_norm_params, normalize, denormalize
@@ -57,7 +55,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 
 
 # ══════════════════════════════════════════════════════════════
@@ -440,7 +437,7 @@ def _make_stage(dim, num_heads, window_size, depth):
 class SwinUnet3D(nn.Module):
     """
     3D Swin-Unet with GSC, FUE, and a Restormer-style transposed-conv
-    decoder. Designed to fit ~8 min/stack on T4 at the default config.
+    decoder.
 
     Topology:
         Stem 3x3x3 conv -> dim channels
@@ -618,7 +615,7 @@ def _augment_3d(vol, aug_id):
 
 
 # ══════════════════════════════════════════════════════════════
-# TRAINING — fp16, two-stage, L1 at masked voxels only
+# TRAINING — fp32, two-stage, L1 at masked voxels only
 # ══════════════════════════════════════════════════════════════
 
 def train_self_supervised(stack, device, config=None, verbose=True):
@@ -633,7 +630,7 @@ def train_self_supervised(stack, device, config=None, verbose=True):
         "patch_d":          32,
         "patch_hw":         64,
         "batch_size":       2,
-        # schedule (fits ~8 min/stack on T4)
+        # schedule
         "warmup_iters":     100,
         "n2v_iters":        1200,
         "lr":               4e-4,
@@ -648,7 +645,6 @@ def train_self_supervised(stack, device, config=None, verbose=True):
     F_total, H, W = stack.shape
     pd, phw = cfg["patch_d"], cfg["patch_hw"]
     bs = cfg["batch_size"]
-    use_amp = (device.type == "cuda")
 
     if verbose:
         print(f" Stack: {stack.shape}, device: {device}")
@@ -658,7 +654,7 @@ def train_self_supervised(stack, device, config=None, verbose=True):
         print(f" Schedule: warmup={cfg['warmup_iters']}, n2v={cfg['n2v_iters']}")
         print(f" Masking: ratio={cfg['mask_ratio']}, "
               f"radius_s={cfg['mask_radius_s']}, radius_t={cfg['mask_radius_t']}")
-        print(f" Mixed precision (fp16): {use_amp}")
+        print(f" Precision: fp32")
 
     norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
     norm_strategy = _prep.resolve_normalization(norm_name)
@@ -709,7 +705,6 @@ def train_self_supervised(stack, device, config=None, verbose=True):
                                 weight_decay=1e-4, betas=(0.9, 0.999))
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["warmup_iters"], eta_min=cfg["lr"] * 0.1)
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
         for it in range(cfg["warmup_iters"]):
@@ -726,18 +721,15 @@ def train_self_supervised(stack, device, config=None, verbose=True):
             tgt = torch.stack(targets, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)
-                loss = F.l1_loss(pred, tgt)
+            pred = model(inp)
+            loss = F.l1_loss(pred, tgt)
             if not torch.isfinite(loss):
                 if verbose:
                     print(f"   WARN non-finite at iter {it}, skip")
                 continue
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rl += loss.item()
             if verbose and (it + 1) % 50 == 0:
@@ -754,7 +746,6 @@ def train_self_supervised(stack, device, config=None, verbose=True):
                                 betas=(0.9, 0.999))
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["n2v_iters"], eta_min=1e-6)
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
         for it in range(cfg["n2v_iters"]):
@@ -774,23 +765,20 @@ def train_self_supervised(stack, device, config=None, verbose=True):
             inp = torch.stack(patches, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)
-                loss = torch.tensor(0.0, device=device)
-                for b, (mz, my, mx, orig) in enumerate(all_orig):
-                    pred_at_mask = pred[b, 0, mz, my, mx]
-                    loss = loss + F.l1_loss(pred_at_mask, orig)
-                loss = loss / bs
+            pred = model(inp)
+            loss = torch.tensor(0.0, device=device)
+            for b, (mz, my, mx, orig) in enumerate(all_orig):
+                pred_at_mask = pred[b, 0, mz, my, mx]
+                loss = loss + F.l1_loss(pred_at_mask, orig)
+            loss = loss / bs
 
             if not torch.isfinite(loss):
                 if verbose:
                     print(f"   WARN non-finite at iter {it}, skip")
                 continue
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rl += loss.item()
             if verbose and (it + 1) % 200 == 0:

@@ -55,7 +55,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
 
 
 # ══════════════════════════════════════════════════════════════
@@ -553,7 +552,7 @@ def train_self_supervised(
     Stage 0 — Temporal-median warmup (structural prior)
     Stage 1 — 3D Noise2Void blind-spot
 
-    Uses fp16 mixed-precision (autocast + GradScaler) on CUDA.
+    Trains in full fp32 for numerical stability.
     """
     t0 = time.time()
     cfg = {
@@ -582,7 +581,6 @@ def train_self_supervised(
     F_total, H, W = stack.shape
     pd, phw = cfg["patch_d"], cfg["patch_hw"]
     bs = cfg["batch_size"]
-    use_amp = (device.type == "cuda")
 
     if verbose:
         print(f" Stack: {stack.shape}, device: {device}")
@@ -590,7 +588,7 @@ def train_self_supervised(
               f"heads={cfg['heads']}, ffn={cfg['ffn_expansion_factor']}")
         print(f" Patch: {pd}x{phw}x{phw}, batch={bs}")
         print(f" Stages: warmup={cfg['warmup_iters']}, n2v={cfg['n2v_iters']}")
-        print(f" Mixed precision (fp16): {use_amp}")
+        print(f" Precision: fp32")
 
     # ── Normalize (strategy from config) ────────────────
     norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
@@ -660,7 +658,6 @@ def train_self_supervised(
             opt, cfg["warmup_iters"], eta_min=cfg["lr"] * 0.1,
         )
         crit = nn.MSELoss()
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
 
@@ -680,20 +677,17 @@ def train_self_supervised(
             tgt = torch.stack(targets, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)
-                loss = crit(pred, tgt)
+            pred = model(inp)
+            loss = crit(pred, tgt)
 
             if not torch.isfinite(loss):
                 if verbose:
                     print(f"   WARN non-finite loss at iter {it}, skipping")
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rl += loss.item()
 
@@ -713,7 +707,6 @@ def train_self_supervised(
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, cfg["n2v_iters"], eta_min=1e-6,
         )
-        scaler = GradScaler(enabled=use_amp)
         model.train()
         rl = 0.0
 
@@ -735,24 +728,21 @@ def train_self_supervised(
             inp = torch.stack(patches, dim=0).to(device)
 
             opt.zero_grad()
-            with autocast(enabled=use_amp, dtype=torch.float16):
-                pred = model(inp)
-                loss = torch.tensor(0.0, device=device)
-                for b, (mz, my, mx, orig) in enumerate(all_orig):
-                    pred_at_mask = pred[b, 0, mz, my, mx]
-                    loss = loss + F.mse_loss(pred_at_mask, orig)
-                loss = loss / bs
+            pred = model(inp)
+            loss = torch.tensor(0.0, device=device)
+            for b, (mz, my, mx, orig) in enumerate(all_orig):
+                pred_at_mask = pred[b, 0, mz, my, mx]
+                loss = loss + F.mse_loss(pred_at_mask, orig)
+            loss = loss / bs
 
             if not torch.isfinite(loss):
                 if verbose:
                     print(f"   WARN non-finite loss at iter {it}, skipping")
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            opt.step()
             sch.step()
             rl += loss.item()
 
@@ -783,12 +773,8 @@ def denoise_stack(
 ) -> np.ndarray:
     """
     Sliding-window inference with Gaussian spatial blending.
-    Forces fp32 inference for numerical stability — fp16 inference can
-    leak NaN/Inf into the blended output and produce flat (all-black)
-    frames.
     """
     model.eval()
-    # Force model to fp32 for inference (training may have used fp16)
     model = model.float()
 
     norm_params = config["norm_params"]
@@ -916,7 +902,6 @@ def denoise_stack(
                         mode="reflect",
                     )
                 inp = patch.unsqueeze(0).unsqueeze(0).float()
-                # No autocast — fp32 inference
                 pred = model(inp).squeeze(0).squeeze(0).float()
                 pred = pred[:ad, :ah, :aw]
                 win = gauss_win[:ad, :ah, :aw]
@@ -945,7 +930,7 @@ def denoise_stack(
     output = output.cpu().numpy()
     output = norm_strategy.inverse(output, norm_params)
 
-    # Replace any NaN/Inf with sane values (fp16 leakage guard)
+    # Replace any NaN/Inf with sane values (general numerical safety)
     output = np.nan_to_num(
         output,
         nan=float(stack.mean()),
