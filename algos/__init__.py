@@ -115,6 +115,60 @@ REGISTRY: Dict[str, AlgoSpec] = {
         paper="chhayanshporwal/3d-n2v-calcium-denoising (community submission, 2025)",
         tags=["unet", "n2v", "pretrained", "baseline"],
     ),
+
+    "nafnet2d": AlgoSpec(
+        name="nafnet2d",
+        module="algos.nafnet2d",
+        family="NAFNet",
+        description="Per-frame NAFNet (SimpleGate + SCA) trained with 2D Noise2Void.",
+        paper="Chen et al., ECCV 2022 (arXiv 2204.04676)",
+        tags=["nafnet", "n2v", "2d"],
+    ),
+
+    "nafnet3d": AlgoSpec(
+        name="nafnet3d",
+        module="algos.nafnet3d",
+        family="NAFNet",
+        description="3D NAFNet (Conv3d throughout) trained with 3D Noise2Void; volumetric extension of the ECCV 2022 architecture.",
+        paper="Chen et al., ECCV 2022 (extended to 3D)",
+        tags=["nafnet", "n2v", "3d"],
+    ),
+
+    "deepcad": AlgoSpec(
+        name="deepcad",
+        module="algos.deepcad",
+        family="DeepCAD",
+        description="DeepCAD 3D U-Net (Li et al. Nat Methods 2021). Architecture-faithful; trained with our N2V flow rather than the official interleaved-frames N2N scheme.",
+        paper="Li et al., Nature Methods 2021",
+        tags=["deepcad", "unet", "n2v", "3d"],
+    ),
+
+    "swinir2d": AlgoSpec(
+        name="swinir2d",
+        module="algos.swinir2d",
+        family="SwinIR",
+        description="SwinIR for per-frame denoising — paper architecture (Liang et al. ICCVW 2021), denoising configuration (no upscaling head).",
+        paper="Liang et al., ICCVW 2021 (arXiv 2108.10257)",
+        tags=["swinir", "swin", "transformer", "2d"],
+    ),
+
+    "swinir3d": AlgoSpec(
+        name="swinir3d",
+        module="algos.swinir3d",
+        family="SwinIR",
+        description="SwinIR extended to 3D windowed attention (our research extension — NOT from any paper).",
+        paper="Liang et al., ICCVW 2021 (extended to 3D)",
+        tags=["swinir", "swin", "transformer", "3d"],
+    ),
+
+    "srdtrans": AlgoSpec(
+        name="srdtrans",
+        module="algos.srdtrans",
+        family="SRDTrans",
+        description="SRDTrans architecture (Li et al. Nat Comp Sci 2023). Lightweight spatiotemporal transformer with temporal encoder/decoder; trained with our N2V flow rather than the official spatial-redundancy sampling.",
+        paper="Li et al., Nature Computational Science 2023",
+        tags=["srdtrans", "transformer", "3d"],
+    ),
 }
 
 
