@@ -1,8 +1,4 @@
-"""Ablation space for srdtrans.
-
-Key SRDTrans-specific ablations: number of temporal compression levels,
-number of STB blocks, attention head count.
-"""
+"""Ablation space for srdtrans (paper-faithful spatial-redundancy training)."""
 
 BASE_CONFIG = {
     "algo":            "srdtrans",
@@ -16,26 +12,26 @@ BASE_CONFIG = {
     "patch_d":         16,
     "patch_hw":        48,
     "batch_size":      1,
-    "warmup_iters":    200,
-    "n2v_iters":       2500,
+    "srd_iters":       2500,
     "lr":              2e-4,
-    "mask_ratio":      0.015,
-    "mask_radius":     2,
+    "loss":            "l1",
     "normalization":   "p0.5_p99.5",
     "temporal_target": "temporal_median_2d",
 }
 
-DESCRIPTION = "SRDTrans — ablate temporal-encoder depth, STB count, heads."
+DESCRIPTION = "SRDTrans (SRD) — ablate temporal-encoder depth, STB count, heads, loss."
 
 ABLATIONS = {
     "baseline":             {},
 
     # Schedule
-    "no_warmup":            {"warmup_iters": 0},
-    "short_n2v":            {"n2v_iters": 1500},
+    "short_srd":            {"srd_iters": 1500},
+    "long_srd":             {"srd_iters": 4000},
+
+    # Loss
+    "l2_loss":              {"loss": "l2"},
 
     # SRDTrans-specific architecture
-    # n_time_levels=0 is invalid (loop runs zero times) → minimum is 1
     "shallow_time_encoder": {"n_time_levels": 1},
     "deep_time_encoder":    {"n_time_levels": 3, "patch_d": 32},
     "more_stb_blocks":      {"n_stb_blocks": 4},
@@ -46,10 +42,9 @@ ABLATIONS = {
     "small_embed_dim":      {"embed_dim": 16},
     "large_embed_dim":      {"embed_dim": 48},
 
-    # Masking
-    "mask_radius_1":        {"mask_radius": 1},
-    "mask_radius_3":        {"mask_radius": 3},
-    "high_mask_ratio":      {"mask_ratio": 0.03},
+    # Patch
+    "small_patch_hw":       {"patch_hw": 32},
+    "large_patch_hw":       {"patch_hw": 64},
 
     # LR
     "low_lr":               {"lr": 5e-5},

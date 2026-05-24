@@ -310,31 +310,8 @@ class SRDTransNet(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-# 3D BLIND-SPOT + AUG + WINDOW
+# AUGMENTATIONS + INFERENCE WINDOW
 # ══════════════════════════════════════════════════════════════
-
-def n2v_mask_3d(volume: torch.Tensor, mask_ratio: float = 0.015,
-                radius: int = 2):
-    D, H, W = volume.shape
-    n_vox = D * H * W
-    n_mask = max(int(n_vox * mask_ratio), 1)
-    flat_idx = torch.randperm(n_vox, device=volume.device)[:n_mask]
-    mz = flat_idx // (H * W)
-    my = (flat_idx % (H * W)) // W
-    mx = flat_idx % W
-    original = volume[mz, my, mx].clone()
-    dz = torch.randint(-radius, radius + 1, (n_mask,), device=volume.device)
-    dy = torch.randint(-radius, radius + 1, (n_mask,), device=volume.device)
-    dx = torch.randint(-radius, radius + 1, (n_mask,), device=volume.device)
-    same = (dz == 0) & (dy == 0) & (dx == 0)
-    dz[same] = 1
-    nz = (mz + dz).clamp(0, D - 1)
-    ny = (my + dy).clamp(0, H - 1)
-    nx = (mx + dx).clamp(0, W - 1)
-    masked = volume.clone()
-    masked[mz, my, mx] = volume[nz, ny, nx]
-    return masked, (mz, my, mx), original
-
 
 def _augment_3d(vol: torch.Tensor, aug_id: int) -> torch.Tensor:
     if aug_id >= 4:
@@ -358,10 +335,66 @@ def _gaussian_window_3d(shape, sigma_frac=0.25, device="cpu"):
 
 
 # ══════════════════════════════════════════════════════════════
-# TRAINING
+# SPATIAL-REDUNDANCY SAMPLING (paper-faithful per Li et al. NCS 2023)
 # ══════════════════════════════════════════════════════════════
+#
+# SRDTrans uses orthogonal spatial-redundancy mask sampling:
+#   * Take a sub-volume of size [T, H, W] with H, W even.
+#   * Split the H×W grid into 2×2 blocks. Within each block:
+#         (0,0) → input
+#         (1,1) → target1     (diagonal — "orthogonal")
+#         (0,1), (1,0) → optional second targets
+#   * Sub-sampled stacks have size [T, H/2, W/2] — half spatial resolution.
+#   * Adjacent block-corner pixels share approximately the same underlying
+#     signal (high spatial redundancy) but have independent noise → N2N.
+#
+# Inference: apply the model to the FULL-resolution stack. SRDTrans's
+# architecture is fully convolutional / window-attentive in space, so it
+# generalises to non-half resolutions.
+
+def _spatial_redundancy_pair(volume: torch.Tensor, mode: str = "random"):
+    """Return (input_subvol, target_subvol), both shape [D, H/2, W/2].
+
+    `mode`:
+        "random"      : randomly pick one of the 4 orthogonal pairings:
+                        (0,0)↔(1,1), (0,1)↔(1,0), (1,1)↔(0,0), (1,0)↔(0,1)
+        "diagonal"    : always (0,0) → (1,1)
+        "anti_diag"   : always (0,1) → (1,0)
+    """
+    D, H, W = volume.shape
+    H2, W2 = H // 2, W // 2
+    # Trim H, W to even
+    volume = volume[:, : H2 * 2, : W2 * 2]
+    # Each of the 4 corner sub-stacks
+    s00 = volume[:, 0::2, 0::2]
+    s01 = volume[:, 0::2, 1::2]
+    s10 = volume[:, 1::2, 0::2]
+    s11 = volume[:, 1::2, 1::2]
+
+    if mode == "diagonal":
+        return s00, s11
+    if mode == "anti_diag":
+        return s01, s10
+    # random — pick one of 4 orderings
+    pairings = [(s00, s11), (s11, s00), (s01, s10), (s10, s01)]
+    idx = int(torch.randint(0, 4, (1,)).item())
+    return pairings[idx]
+
+
+# ══════════════════════════════════════════════════════════════
+# TRAINING — spatial-redundancy sampling (paper-faithful)
+# ══════════════════════════════════════════════════════════════
+#
+# Replaces the previous N2V-based training. Aligned with the official
+# SRDTrans repo's training scheme:
+#   * Crop a random sub-volume [pd, phw, phw] with phw even.
+#   * Build an (input, target) pair via _spatial_redundancy_pair() — both
+#     have shape [pd, phw/2, phw/2].
+#   * Forward the input through the model, take L1 loss against target.
+#   * Single-stage training — NO temporal-median warmup.
 
 def train_self_supervised(stack, device, config=None, verbose=True):
+    """Paper-faithful spatial-redundancy training for SRDTrans."""
     t0 = time.time()
     cfg = {
         "embed_dim":      32,
@@ -370,21 +403,34 @@ def train_self_supervised(stack, device, config=None, verbose=True):
         "num_heads":      4,
         "mlp_ratio":      2.0,
         "time_compress_r": 2,
+        # Patch sampling — phw must be EVEN (we split 2×2 blocks)
         "patch_d":        16,
-        "patch_hw":       48,
+        "patch_hw":       48,    # will be bumped to even if odd
         "batch_size":     1,
-        "warmup_iters":   200,
-        "n2v_iters":      2500,
+        # Schedule — single-stage spatial-redundancy training
+        "srd_iters":      2500,
         "lr":             2e-4,
-        "mask_ratio":     0.015,
-        "mask_radius":    2,
+        # Loss
+        "loss":           "l1",   # paper uses L1
     }
     if config:
         cfg.update(config)
 
+    # Ensure phw is even
+    if cfg["patch_hw"] % 2 != 0:
+        cfg["patch_hw"] += 1
+        if verbose:
+            print(f" patch_hw was odd; bumped to {cfg['patch_hw']} for "
+                  f"spatial-redundancy 2×2 split")
+
     F_total, H, W = stack.shape
-    pd, phw = cfg["patch_d"], cfg["patch_hw"]
+    pd = min(cfg["patch_d"], F_total)
+    phw = cfg["patch_hw"]
     bs = cfg["batch_size"]
+
+    if phw < 4 or H < 4 or W < 4:
+        raise ValueError(f"Stack too small for spatial-redundancy "
+                          f"sampling (need phw≥4, H≥4, W≥4)")
 
     if verbose:
         print(f" Stack: {stack.shape}, device: {device}")
@@ -392,29 +438,33 @@ def train_self_supervised(stack, device, config=None, verbose=True):
               f"n_time_levels={cfg['n_time_levels']}, "
               f"n_stb_blocks={cfg['n_stb_blocks']}, "
               f"heads={cfg['num_heads']}")
-        print(f" Patch: {pd}x{phw}x{phw}, batch={bs}")
-        print(f" Schedule: warmup={cfg['warmup_iters']}, "
-              f"n2v={cfg['n2v_iters']}")
+        print(f" Patch: {pd}x{phw}x{phw} → spatial-redundancy split into "
+              f"two {pd}x{phw//2}x{phw//2} sub-stacks, batch={bs}")
+        print(f" Schedule: srd_iters={cfg['srd_iters']}, lr={cfg['lr']}")
+        print(f" Loss: {cfg['loss']}")
         print(f" Precision: fp32")
+        print(f" Self-supervision: spatial-redundancy sampling "
+              f"(paper-faithful, NO temporal-median warmup)")
 
+    # ── Normalize ──────────────────────────────────────────
     norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
     norm_strategy = _prep.resolve_normalization(norm_name)
     norm_params = norm_strategy.compute_params(stack)
     cfg["norm_params"] = norm_params
     cfg["__resolved_normalization"] = norm_strategy.name
     stack_norm = norm_strategy.forward(stack, norm_params)
+    if verbose:
+        print(f" Norm [{norm_strategy.name}]: "
+              f"shift={norm_params['shift']:.2f}, "
+              f"scale={norm_params['scale']:.2f}, "
+              f"range=[{stack_norm.min():.3f}, {stack_norm.max():.3f}]")
 
-    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
-    tt_strategy = _prep.resolve_temporal_target(tt_name)
-    cfg["__resolved_temporal_target"] = tt_strategy.name
-    if tt_strategy.returns != "2d":
-        _tt = tt_strategy.compute(stack_norm)
-        temporal_med = np.median(_tt, axis=0).astype(np.float32)
-    else:
-        temporal_med = tt_strategy.compute(stack_norm)
+    # NOTE: SRDTrans (per paper) does NOT use temporal-median warmup.
+    # The temporal_target config key is recorded for framework compatibility
+    # but unused at training time.
+    cfg["__resolved_temporal_target"] = "noop_srdtrans_srd_does_not_use_it"
 
     stack_t = torch.from_numpy(stack_norm).float().to(device)
-    tmed_t = torch.from_numpy(temporal_med).float().to(device)
 
     model = SRDTransNet(
         embed_dim=cfg["embed_dim"],
@@ -428,87 +478,58 @@ def train_self_supervised(stack, device, config=None, verbose=True):
         n_params = sum(p.numel() for p in model.parameters())
         print(f" Model params: {n_params:,}")
 
-    def random_patch():
-        t0_ = np.random.randint(0, max(F_total - pd, 1))
-        y0 = np.random.randint(0, max(H - phw, 1))
-        x0 = np.random.randint(0, max(W - phw, 1))
+    def random_srd_pair():
+        """Sample a sub-volume, return spatial-redundancy (input, target)."""
+        t0_ = np.random.randint(0, max(F_total - pd + 1, 1))
+        y0 = np.random.randint(0, max(H - phw + 1, 1))
+        x0 = np.random.randint(0, max(W - phw + 1, 1))
         d = min(pd, F_total); h = min(phw, H); w = min(phw, W)
-        return (stack_t[t0_:t0_+d, y0:y0+h, x0:x0+w],
-                tmed_t[y0:y0+h, x0:x0+w])
+        # Trim h, w to even
+        h -= h % 2; w -= w % 2
+        sub = stack_t[t0_:t0_+d, y0:y0+h, x0:x0+w]
+        inp, tgt = _spatial_redundancy_pair(sub, mode="random")
+        return inp, tgt
 
-    if cfg["warmup_iters"] > 0:
-        if verbose:
-            print(f"\n [Stage 0] Temporal-median warmup — "
-                  f"{cfg['warmup_iters']} iters")
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
-                                 weight_decay=1e-5)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, cfg["warmup_iters"], eta_min=cfg["lr"] * 0.1)
-        model.train(); rl = 0.0
-        for it in range(cfg["warmup_iters"]):
-            patches, targets = [], []
-            for _ in range(bs):
-                vol, tmed_crop = random_patch()
-                aug = np.random.randint(0, 8)
-                vol = _augment_3d(vol, aug)
-                tmed_b = _augment_3d(
-                    tmed_crop.unsqueeze(0).expand(vol.shape[0], -1, -1), aug,
-                )
-                patches.append(vol.unsqueeze(0))
-                targets.append(tmed_b.unsqueeze(0))
-            inp = torch.stack(patches, dim=0).to(device)
-            tgt = torch.stack(targets, dim=0).to(device)
-            opt.zero_grad()
-            pred = model(inp)
-            loss = F.l1_loss(pred, tgt)
-            if not torch.isfinite(loss):
-                continue
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sch.step(); rl += loss.item()
-            if verbose and (it + 1) % 100 == 0:
-                print(f"   {it+1:>5}/{cfg['warmup_iters']} "
-                      f"loss={rl/100:.6f}  {time.time()-t0:.1f}s")
-                rl = 0.0
+    loss_fn = F.l1_loss if cfg["loss"] == "l1" else F.mse_loss
 
-    if cfg["n2v_iters"] > 0:
-        if verbose:
-            print(f"\n [Stage 1] 3D Noise2Void — {cfg['n2v_iters']} iters")
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"] * 0.5,
-                                 weight_decay=1e-5)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, cfg["n2v_iters"], eta_min=1e-6)
-        model.train(); rl = 0.0
-        for it in range(cfg["n2v_iters"]):
-            all_orig, patches = [], []
-            for _ in range(bs):
-                vol, _ = random_patch()
-                aug = np.random.randint(0, 8)
-                vol = _augment_3d(vol, aug)
-                masked, (mz, my, mx), orig = n2v_mask_3d(
-                    vol, mask_ratio=cfg["mask_ratio"],
-                    radius=cfg["mask_radius"],
-                )
-                patches.append(masked.unsqueeze(0))
-                all_orig.append((mz, my, mx, orig))
-            inp = torch.stack(patches, dim=0).to(device)
-            opt.zero_grad()
-            pred = model(inp)
-            loss = torch.tensor(0.0, device=device)
-            for b, (mz, my, mx, orig) in enumerate(all_orig):
-                loss = loss + F.l1_loss(pred[b, 0, mz, my, mx], orig)
-            loss = loss / bs
-            if not torch.isfinite(loss):
-                continue
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sch.step(); rl += loss.item()
-            if verbose and (it + 1) % 250 == 0:
-                lr_now = sch.get_last_lr()[0]
-                print(f"   {it+1:>5}/{cfg['n2v_iters']} "
-                      f"loss={rl/250:.6f} lr={lr_now:.2e} "
-                      f"{time.time()-t0:.1f}s")
-                rl = 0.0
+    # ── Single-stage SRD training ────────────────────────
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                             weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, cfg["srd_iters"], eta_min=cfg["lr"] * 0.05)
+    model.train()
+    rl = 0.0
+    print_every = max(50, cfg["srd_iters"] // 20)
+    if verbose:
+        print(f"\n [SRD training] {cfg['srd_iters']} iters")
+    for it in range(cfg["srd_iters"]):
+        inputs, targets = [], []
+        for _ in range(bs):
+            inp_vol, tgt_vol = random_srd_pair()
+            aug = np.random.randint(0, 8)
+            inp_vol = _augment_3d(inp_vol, aug)
+            tgt_vol = _augment_3d(tgt_vol, aug)
+            inputs.append(inp_vol.unsqueeze(0))
+            targets.append(tgt_vol.unsqueeze(0))
+        inp = torch.stack(inputs, dim=0).to(device)
+        tgt = torch.stack(targets, dim=0).to(device)
+
+        opt.zero_grad()
+        pred = model(inp)
+        loss = loss_fn(pred, tgt)
+        if not torch.isfinite(loss):
+            continue
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sch.step()
+        rl += loss.item()
+        if verbose and (it + 1) % print_every == 0:
+            lr_now = sch.get_last_lr()[0]
+            print(f"   {it+1:>5}/{cfg['srd_iters']} "
+                  f"loss={rl/print_every:.6f} lr={lr_now:.2e} "
+                  f"{time.time()-t0:.1f}s")
+            rl = 0.0
 
     elapsed = time.time() - t0
     if verbose:

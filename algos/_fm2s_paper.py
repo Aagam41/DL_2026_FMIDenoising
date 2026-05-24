@@ -317,7 +317,7 @@ def fm2s_train_on_stack(
     # ── Temporal median clean target ──────────────
     if verbose:
         print("  Computing temporal median clean target...")
-    temporal_med = compute_temporal_clean_target(stack_float, max_frames=2000)
+    temporal_med = compute_temporal_clean_target(stack_float, max_frames=800)
 
     # Shift by val_min then normalize to [0, 1]
     clean_norm = np.clip((temporal_med - val_min) / val_range, 0, 1).astype(np.float32)

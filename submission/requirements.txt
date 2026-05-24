@@ -1,0 +1,16 @@
+# Core
+numpy<2.0
+SimpleITK
+tifffile
+scikit-image
+
+# DL framework — base image already provides torch, torchvision.
+# Listed here for documentation, pinned weakly to avoid conflicting
+# with the pytorch/pytorch base. If you need a specific torch version,
+# pin it in the Dockerfile FROM line instead.
+
+# Transformers used by SwinIR / SRDTrans / Swin-Unet
+einops
+
+# Used by some configs (HPO, ablation deps) — harmless on inference.
+# Excluded: optuna (HPO-only, not used at inference time)

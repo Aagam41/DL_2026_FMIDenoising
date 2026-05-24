@@ -60,8 +60,8 @@ def suggest(trial):
     mask_radius = trial.suggest_int("mask_radius", 1, 3)
 
     # ── Schedule (will be scaled down by --reduce in the optimizer) ─
-    warmup_iters = trial.suggest_int("warmup_iters", 200, 600, step=100)
-    n2v_iters = trial.suggest_int("n2v_iters", 2000, 5000, step=500)
+    warmup_iters = trial.suggest_int("warmup_iters", 100, 300, step=50)
+    n2v_iters = trial.suggest_int("n2v_iters", 1000, 2000, step=500)
 
     # ── Model capacity (discrete, small set) ───────────────────────
     base_ch = trial.suggest_categorical("base_ch", [32, 48, 64])

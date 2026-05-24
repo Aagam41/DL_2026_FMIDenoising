@@ -11,7 +11,4 @@ CONFIG = {
     "max_epoch":    10,
     "stage1_steps": 10,
     "lr":           1e-3,
-
-    "normalization": "chhayansh",
-    "temporal_target": "full_stack_median_2d",
 }

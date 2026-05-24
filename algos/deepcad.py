@@ -193,32 +193,8 @@ class DeepCADUNet(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════
-# 3D BLIND-SPOT MASKING (Noise2Void, same primitive as DVT/Restormer)
+# AUGMENTATIONS + INFERENCE WINDOW
 # ══════════════════════════════════════════════════════════════
-
-def n2v_mask_3d(volume: torch.Tensor, mask_ratio: float = 0.015,
-                radius: int = 2):
-    """3D Noise2Void on [D, H, W]: returns (masked_vol, indices, originals)."""
-    D, H, W = volume.shape
-    n_vox = D * H * W
-    n_mask = max(int(n_vox * mask_ratio), 1)
-    flat_idx = torch.randperm(n_vox, device=volume.device)[:n_mask]
-    mz = flat_idx // (H * W)
-    my = (flat_idx % (H * W)) // W
-    mx = flat_idx % W
-    original = volume[mz, my, mx].clone()
-    dz = torch.randint(-radius, radius + 1, (n_mask,), device=volume.device)
-    dy = torch.randint(-radius, radius + 1, (n_mask,), device=volume.device)
-    dx = torch.randint(-radius, radius + 1, (n_mask,), device=volume.device)
-    same = (dz == 0) & (dy == 0) & (dx == 0)
-    dz[same] = 1
-    nz = (mz + dz).clamp(0, D - 1)
-    ny = (my + dy).clamp(0, H - 1)
-    nx = (mx + dx).clamp(0, W - 1)
-    masked = volume.clone()
-    masked[mz, my, mx] = volume[nz, ny, nx]
-    return masked, (mz, my, mx), original
-
 
 def _augment_3d(vol: torch.Tensor, aug_id: int) -> torch.Tensor:
     if aug_id >= 4:
@@ -243,8 +219,29 @@ def _gaussian_window_3d(shape, sigma_frac=0.25, device="cpu"):
 
 
 # ══════════════════════════════════════════════════════════════
-# TRAINING (self-supervised, two-stage)
+# TRAINING — Noise2Noise on interleaved odd/even frames
+# (paper-faithful per Li et al. Nat Methods 2021)
 # ══════════════════════════════════════════════════════════════
+#
+# The DeepCAD self-supervised scheme:
+#   1. Crop a random 3D sub-volume of T frames (T even).
+#   2. Split into TWO interleaved sub-stacks:
+#         INPUT  = frames at indices 0,2,4,...  (every other frame)
+#         TARGET = frames at indices 1,3,5,...  (the OTHER set)
+#      Each has T/2 frames.
+#   3. The two share approximately the same calcium signal (assuming the
+#      stack is imaged near video rate, which is typical) but have
+#      INDEPENDENT noise. So predicting one from the other is a valid
+#      Noise2Noise (N2N) setup.
+#   4. Loss is direct L1 / L2 on the full prediction — no blind-spot
+#      masking, no temporal-median warmup.
+#   5. At inference, the model is applied to the FULL stack (T frames,
+#      not T/2). DeepCAD's 3D U-Net is fully convolutional on the time
+#      axis so the architecture handles arbitrary T.
+#
+# Architecture note: input shape goes from [B,1,T/2,H,W] (train) to
+# [B,1,T_infer,H,W] (infer). The U-Net's pad-to-multiple-of-2^depth
+# logic handles both.
 
 def train_self_supervised(
     stack: np.ndarray,
@@ -252,38 +249,50 @@ def train_self_supervised(
     config: dict = None,
     verbose: bool = True,
 ):
-    """Stage 0 — temporal-median warmup; Stage 1 — 3D N2V. Full fp32."""
+    """Noise2Noise training on interleaved odd/even frames (paper-faithful)."""
     t0 = time.time()
     cfg = {
         # Backbone
-        "base_ch":        16,   # DeepCAD default; RT uses 8
-        "depth":          3,    # 3 enc + 3 dec blocks, paper-default
-        # Patch sampling
-        "patch_d":        32,
+        "base_ch":        16,        # DeepCAD default; RT preset uses 4
+        "depth":          3,
+        # Patch sampling — patch_d is the TRAINING sub-volume size (even);
+        # the network sees patch_d // 2 frames per iteration since we split
+        # into odd/even halves.
+        "patch_d":        32,        # must be even
         "patch_hw":       64,
         "batch_size":     2,
-        # Schedule
-        "warmup_iters":   200,
-        "n2v_iters":      3000,
+        # Schedule (DeepCAD paper trains for a few thousand iters per stack)
+        "n2n_iters":      3000,
         "lr":             3e-4,
-        # Masking
-        "mask_ratio":     0.015,
-        "mask_radius":    2,
+        # Loss — paper uses L1 (mean absolute error)
+        "loss":           "l1",      # "l1" or "l2"
     }
     if config:
         cfg.update(config)
 
+    # Ensure patch_d is even — N2N split requires it
+    if cfg["patch_d"] % 2 != 0:
+        cfg["patch_d"] += 1
+        if verbose:
+            print(f" patch_d was odd; bumped to {cfg['patch_d']} for N2N split")
+
     F_total, H, W = stack.shape
-    pd, phw = cfg["patch_d"], cfg["patch_hw"]
+    pd = min(cfg["patch_d"], F_total - (F_total % 2))  # ensure even
+    if pd < 2:
+        raise ValueError(f"Stack too short for N2N: only {F_total} frames")
+    phw = cfg["patch_hw"]
     bs = cfg["batch_size"]
 
     if verbose:
         print(f" Stack: {stack.shape}, device: {device}")
         print(f" DeepCAD: base_ch={cfg['base_ch']}, depth={cfg['depth']}")
-        print(f" Patch: {pd}x{phw}x{phw}, batch={bs}")
-        print(f" Schedule: warmup={cfg['warmup_iters']}, "
-              f"n2v={cfg['n2v_iters']}")
+        print(f" Patch: {pd}x{phw}x{phw} → split into 2 interleaved "
+              f"{pd//2}-frame substacks (N2N), batch={bs}")
+        print(f" Schedule: n2n_iters={cfg['n2n_iters']}, lr={cfg['lr']}")
+        print(f" Loss: {cfg['loss']}")
         print(f" Precision: fp32")
+        print(f" Self-supervision: Noise2Noise (paper-faithful, "
+              f"NO temporal-median warmup)")
 
     # ── Normalize ──────────────────────────────────────────
     norm_name = cfg.get("normalization", DEFAULT_NORMALIZATION)
@@ -298,18 +307,12 @@ def train_self_supervised(
               f"scale={norm_params['scale']:.2f}, "
               f"range=[{stack_norm.min():.3f}, {stack_norm.max():.3f}]")
 
-    # ── Temporal target ───────────────────────────────────
-    tt_name = cfg.get("temporal_target", DEFAULT_TEMPORAL_TARGET)
-    tt_strategy = _prep.resolve_temporal_target(tt_name)
-    cfg["__resolved_temporal_target"] = tt_strategy.name
-    if tt_strategy.returns != "2d":
-        _tt = tt_strategy.compute(stack_norm)
-        temporal_med = np.median(_tt, axis=0).astype(np.float32)
-    else:
-        temporal_med = tt_strategy.compute(stack_norm)
+    # NOTE: DeepCAD does NOT use temporal-median warmup. The temporal_target
+    # config key is ignored here. We still record it so other framework
+    # components don't error out.
+    cfg["__resolved_temporal_target"] = "noop_deepcad_n2n_does_not_use_it"
 
     stack_t = torch.from_numpy(stack_norm).float().to(device)
-    tmed_t = torch.from_numpy(temporal_med).float().to(device)
 
     model = DeepCADUNet(
         base_ch=cfg["base_ch"],
@@ -319,99 +322,64 @@ def train_self_supervised(
         n_params = sum(p.numel() for p in model.parameters())
         print(f" Model params: {n_params:,}")
 
-    def random_patch():
-        t0_ = np.random.randint(0, max(F_total - pd, 1))
-        y0 = np.random.randint(0, max(H - phw, 1))
-        x0 = np.random.randint(0, max(W - phw, 1))
+    def random_n2n_pair():
+        """Sample a sub-volume, split into odd/even halves, return both."""
+        # Pick a random spatiotemporal anchor that fits a pd-frame sub-volume
+        t0_ = np.random.randint(0, max(F_total - pd + 1, 1))
+        y0 = np.random.randint(0, max(H - phw + 1, 1))
+        x0 = np.random.randint(0, max(W - phw + 1, 1))
         d = min(pd, F_total); h = min(phw, H); w = min(phw, W)
-        return (stack_t[t0_:t0_+d, y0:y0+h, x0:x0+w],
-                tmed_t[y0:y0+h, x0:x0+w])
+        sub = stack_t[t0_:t0_+d, y0:y0+h, x0:x0+w]   # [d, h, w]
+        # Split into interleaved halves
+        even = sub[0::2]   # frames 0, 2, 4, ...
+        odd  = sub[1::2]   # frames 1, 3, 5, ...
+        # Randomly assign which is input and which is target — this
+        # gives the network both directions and is a standard N2N trick.
+        if np.random.rand() < 0.5:
+            return even, odd
+        else:
+            return odd, even
 
-    # Stage 0 warmup
-    if cfg["warmup_iters"] > 0:
-        if verbose:
-            print(f"\n [Stage 0] Temporal-median warmup — "
-                  f"{cfg['warmup_iters']} iters")
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
-                                 weight_decay=1e-5)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, cfg["warmup_iters"], eta_min=cfg["lr"] * 0.1)
-        model.train()
-        rl = 0.0
-        for it in range(cfg["warmup_iters"]):
-            patches, targets = [], []
-            for _ in range(bs):
-                vol, tmed_crop = random_patch()
-                aug = np.random.randint(0, 8)
-                vol = _augment_3d(vol, aug)
-                tmed_crop_b = _augment_3d(
-                    tmed_crop.unsqueeze(0).expand(vol.shape[0], -1, -1), aug,
-                )
-                patches.append(vol.unsqueeze(0))
-                targets.append(tmed_crop_b.unsqueeze(0))
-            inp = torch.stack(patches, dim=0).to(device)
-            tgt = torch.stack(targets, dim=0).to(device)
+    loss_fn = F.l1_loss if cfg["loss"] == "l1" else F.mse_loss
 
-            opt.zero_grad()
-            pred = model(inp)
-            loss = F.l1_loss(pred, tgt)
-            if not torch.isfinite(loss):
-                continue
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sch.step()
-            rl += loss.item()
-            if verbose and (it + 1) % 100 == 0:
-                print(f"   {it+1:>5}/{cfg['warmup_iters']} "
-                      f"loss={rl/100:.6f}  {time.time()-t0:.1f}s")
-                rl = 0.0
+    # ── Single-stage N2N training ────────────────────────
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                             weight_decay=1e-5)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, cfg["n2n_iters"], eta_min=cfg["lr"] * 0.05)
+    model.train()
+    rl = 0.0
+    print_every = max(50, cfg["n2n_iters"] // 20)
+    if verbose:
+        print(f"\n [N2N training] {cfg['n2n_iters']} iters")
+    for it in range(cfg["n2n_iters"]):
+        inputs, targets = [], []
+        for _ in range(bs):
+            inp_vol, tgt_vol = random_n2n_pair()
+            aug = np.random.randint(0, 8)
+            inp_vol = _augment_3d(inp_vol, aug)
+            tgt_vol = _augment_3d(tgt_vol, aug)
+            inputs.append(inp_vol.unsqueeze(0))
+            targets.append(tgt_vol.unsqueeze(0))
+        inp = torch.stack(inputs, dim=0).to(device)    # [B, 1, d/2, h, w]
+        tgt = torch.stack(targets, dim=0).to(device)   # [B, 1, d/2, h, w]
 
-    # Stage 1 N2V
-    if cfg["n2v_iters"] > 0:
-        if verbose:
-            print(f"\n [Stage 1] 3D Noise2Void — {cfg['n2v_iters']} iters")
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"] * 0.5,
-                                 weight_decay=1e-5)
-        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, cfg["n2v_iters"], eta_min=1e-6)
-        model.train()
-        rl = 0.0
-        for it in range(cfg["n2v_iters"]):
-            all_orig = []
-            patches = []
-            for _ in range(bs):
-                vol, _ = random_patch()
-                aug = np.random.randint(0, 8)
-                vol = _augment_3d(vol, aug)
-                masked, (mz, my, mx), orig = n2v_mask_3d(
-                    vol, mask_ratio=cfg["mask_ratio"],
-                    radius=cfg["mask_radius"],
-                )
-                patches.append(masked.unsqueeze(0))
-                all_orig.append((mz, my, mx, orig))
-            inp = torch.stack(patches, dim=0).to(device)
-
-            opt.zero_grad()
-            pred = model(inp)
-            loss = torch.tensor(0.0, device=device)
-            for b, (mz, my, mx, orig) in enumerate(all_orig):
-                loss = loss + F.l1_loss(pred[b, 0, mz, my, mx], orig)
-            loss = loss / bs
-
-            if not torch.isfinite(loss):
-                continue
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sch.step()
-            rl += loss.item()
-            if verbose and (it + 1) % 250 == 0:
-                lr_now = sch.get_last_lr()[0]
-                print(f"   {it+1:>5}/{cfg['n2v_iters']} "
-                      f"loss={rl/250:.6f} lr={lr_now:.2e} "
-                      f"{time.time()-t0:.1f}s")
-                rl = 0.0
+        opt.zero_grad()
+        pred = model(inp)
+        loss = loss_fn(pred, tgt)
+        if not torch.isfinite(loss):
+            continue
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        sch.step()
+        rl += loss.item()
+        if verbose and (it + 1) % print_every == 0:
+            lr_now = sch.get_last_lr()[0]
+            print(f"   {it+1:>5}/{cfg['n2n_iters']} "
+                  f"loss={rl/print_every:.6f} lr={lr_now:.2e} "
+                  f"{time.time()-t0:.1f}s")
+            rl = 0.0
 
     elapsed = time.time() - t0
     if verbose:
