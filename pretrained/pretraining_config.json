@@ -1,0 +1,68 @@
+{
+  "started_at": "2026-05-24T17:25:58.859166+00:00",
+  "args": {
+    "train_dir": "data/train",
+    "val_noisy_dir": "data/test",
+    "val_clean_dir": "data/gt",
+    "output_dir": "pretrained",
+    "config": "/home/aagamsheth/Documents/DL_2026_FMIDenoising/configs/dvt_unet3d_pretrain.py",
+    "total_iters": 50000,
+    "warmup_iters": null,
+    "checkpoint_interval": 500,
+    "val_stacks_subset": null,
+    "seed": 42,
+    "force_overwrite": false
+  },
+  "config": {
+    "base_ch": 64,
+    "token_dim": 256,
+    "grid_shape": [
+      4,
+      8,
+      8
+    ],
+    "n_vit_blocks": 2,
+    "n_heads": 4,
+    "patch_d": 32,
+    "patch_hw": 128,
+    "batch_size": 4,
+    "warmup_iters": 2000,
+    "n2v_iters": 48000,
+    "lr": 0.0006761147179060029,
+    "mask_ratio": 0.023227574381284047,
+    "mask_radius": 1,
+    "normalization": "p3_p97",
+    "temporal_target": "full_stack_median_2d"
+  },
+  "train_stacks": [
+    "data/train/A1.tif",
+    "data/train/B1.tif",
+    "data/train/C2.tif",
+    "data/train/D2.tif"
+  ],
+  "val_pairs": [
+    [
+      "F0",
+      "data/test/F0.tif",
+      "data/gt/F0.tif"
+    ],
+    [
+      "F1",
+      "data/test/F1.tif",
+      "data/gt/F1.tif"
+    ],
+    [
+      "F2",
+      "data/test/F2.tif",
+      "data/gt/F2.tif"
+    ],
+    [
+      "F3",
+      "data/test/F3.tif",
+      "data/gt/F3.tif"
+    ]
+  ],
+  "n_params": 7299968,
+  "device": "cuda",
+  "gpu_name": "NVIDIA GeForce RTX 5090"
+}

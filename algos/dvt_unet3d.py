@@ -476,6 +476,7 @@ def train_self_supervised(
     device: torch.device,
     config: dict = None,
     verbose: bool = True,
+    init_state_dict: dict = None,
 ):
     """
     Stage 0 — Temporal-median warmup
@@ -489,6 +490,11 @@ def train_self_supervised(
         stack:  [F, H, W] numpy array (raw, original values).
         device: torch device.
         config: optional overrides for any default key below.
+        init_state_dict: optional pre-trained weights to load into the
+            model BEFORE training starts. Used for fine-tuning from a
+            pretrained checkpoint. The architecture in `config` must match
+            the architecture the state_dict was saved with; loading uses
+            `strict=True` and will fail loud on mismatch.
     Returns:
         (model, cfg)  — the trained DVTUNet3D and the full config used.
     """
@@ -574,6 +580,27 @@ def train_self_supervised(
         n_dvt = sum(p.numel() for p in model.dvt.parameters())
         print(f" Model params: {n_params:,}  "
               f"(DVT bottleneck: {n_dvt:,} = {100*n_dvt/n_params:.1f}%)")
+
+    # Optionally initialize from pretrained weights (fine-tuning).
+    if init_state_dict is not None:
+        # strict=True will raise on any size or key mismatch — this is
+        # intentional. Silently loading partial weights leads to subtle
+        # quality regressions that are hard to diagnose later.
+        missing, unexpected = model.load_state_dict(
+            init_state_dict, strict=False
+        )
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Pretrained state_dict does not match current model:\n"
+                f"  missing keys:    {missing[:5]}{'...' if len(missing) > 5 else ''}\n"
+                f"  unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}\n"
+                f"This usually means the architecture (base_ch, token_dim, "
+                f"grid_shape, n_vit_blocks, n_heads) differs between "
+                f"pretraining and fine-tuning. They must match exactly."
+            )
+        if verbose:
+            print(f" Initialized from pretrained state_dict "
+                  f"({len(init_state_dict)} tensors loaded)")
 
     # Random patch helper
     def random_patch():

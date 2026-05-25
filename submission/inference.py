@@ -150,17 +150,59 @@ def interf0_handler():
     for k in ("algo", "name", "description"):
         cfg.pop(k, None)
 
-    # Optional pretrained weights
+    # Optional pretrained weights — three modes:
+    #
+    #   MODE 1 "scratch" : no pretrained file → train from scratch
+    #   MODE 2 "load"    : pretrained exists, SUBMISSION_PRETRAINED_MODE=load
+    #                      → load weights, skip training entirely
+    #   MODE 3 "finetune": pretrained exists (default behavior)
+    #                      → load weights AS INIT, run a short fine-tune,
+    #                        then infer. Requires algo to support
+    #                        `init_state_dict` kwarg in train_self_supervised.
+    #
+    # If pretrained exists but the algo doesn't support init_state_dict,
+    # we fall back to load-only mode with a printed warning.
     pretrained_path = _resolve_pretrained_weights_path(algo_name)
-    use_pretrained = pretrained_path is not None
-    if use_pretrained:
+    requested_mode = os.environ.get("SUBMISSION_PRETRAINED_MODE",
+                                     "finetune").strip().lower()
+    pretrained_state = None
+    mode = "scratch"
+    if pretrained_path is not None:
         print(f"=+= Found pretrained weights: {pretrained_path}")
-        print(f"=+= MODE: load pretrained, skip training "
-              f"(model used as-is for inference)")
+        try:
+            pre_model, pre_cfg = algo_mod.load_checkpoint(
+                str(pretrained_path), device=device,
+            )
+            pretrained_state = pre_model.state_dict()
+            # Free the temporary pre_model — we only needed its state_dict
+            del pre_model
+            try:
+                import torch as _t
+                _t.cuda.empty_cache()
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"    Failed to load pretrained: {e}. "
+                   f"Falling back to scratch.")
+            pretrained_state = None
+
+        if pretrained_state is not None:
+            if requested_mode == "load":
+                mode = "load"
+            else:
+                # Check if algo supports init_state_dict (currently only dvt_unet3d)
+                import inspect
+                tr_sig = inspect.signature(algo_mod.train_self_supervised)
+                if "init_state_dict" in tr_sig.parameters:
+                    mode = "finetune"
+                else:
+                    print(f"    NOTE: algo '{algo_name}' doesn't support "
+                          f"init_state_dict; falling back to load-only mode.")
+                    mode = "load"
     else:
-        print(f"=+= No pretrained weights at {MODEL_DIR}; "
-              f"training from scratch.")
-        print(f"=+= MODE: zero-shot train + infer")
+        print(f"=+= No pretrained weights at {MODEL_DIR}.")
+
+    print(f"=+= MODE: {mode}")
 
     print("\n[1/4] Loading input stack…")
     t_total = time.time()
@@ -181,22 +223,28 @@ def interf0_handler():
         print(f"  Shape: {input_stack.shape}  dtype: {input_stack.dtype}")
         print(f"  Range: [{input_stack.min()}, {input_stack.max()}]")
 
-        if use_pretrained:
-            print(f"\n[2/4] Loading pretrained model…")
+        if mode == "load":
+            print(f"\n[2/4] Loading pretrained model (skip training)…")
             model, config = algo_mod.load_checkpoint(
                 str(pretrained_path), device=device,
             )
-            # Per-stack normalization params still need to be computed
-            # for inference — the model was trained on some other stack.
-            # Use the algo's own compute_norm_params if available.
+            # Recompute per-stack normalization for this input — the model
+            # was trained on a different stack.
             if hasattr(algo_mod, "compute_norm_params"):
                 norm_params = algo_mod.compute_norm_params(input_stack)
                 config["norm_params"] = norm_params
                 print(f"  Re-computed norm params for this stack: "
                        f"shift={norm_params.get('shift', 'n/a'):.2f}, "
                        f"scale={norm_params.get('scale', 'n/a'):.2f}")
+        elif mode == "finetune":
+            print(f"\n[2/4] Fine-tuning ({algo_name}) from pretrained init…")
+            model, config = algo_mod.train_self_supervised(
+                stack=input_stack, device=device, config=dict(cfg),
+                verbose=True, init_state_dict=pretrained_state,
+            )
         else:
-            print(f"\n[2/4] Training ({algo_name})…")
+            # scratch
+            print(f"\n[2/4] Training ({algo_name}) from scratch…")
             model, config = algo_mod.train_self_supervised(
                 stack=input_stack, device=device, config=dict(cfg),
                 verbose=True,
