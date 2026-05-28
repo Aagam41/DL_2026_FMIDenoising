@@ -46,9 +46,9 @@ CONFIG = {
     # No warmup — pretrained model already understands the data
     # distribution, so warmup against temporal median is redundant.
     "warmup_iters": 0,
-    "n2v_iters":    800,
+    "n2v_iters":    200,
     # Lower LR than scratch — standard 5-10× reduction for fine-tuning
-    "lr":           1e-4,
+    "lr":           0.005761147179060029,
 
     # ── Noise2Void mask — same as pretrain ───────────────────────
     "mask_ratio":   0.023227574381284047,

@@ -170,6 +170,17 @@ def main():
                     help="Override paper_frame from config.")
     p.add_argument("--no-checkpoint", action="store_true")
     p.add_argument("--no-figures",    action="store_true")
+    p.add_argument("--pretrained", type=Path, default=None,
+                    help="Optional path to a pretrained checkpoint (.pth). "
+                         "When given, every (algo, stack) job loads these "
+                         "weights as initialization before training. "
+                         "Combined with a config that has 0 training iters, "
+                         "this yields a pure 'load + infer' eval. Combined "
+                         "with a short-schedule config, this yields a "
+                         "fine-tune pass. Algos without init_state_dict "
+                         "support (currently only dvt_unet3d and "
+                         "restormer3d support it) print a warning and "
+                         "train from scratch.")
     p.add_argument("--dry-run", action="store_true",
                     help="List jobs that would run; don't execute.")
     args = p.parse_args()
@@ -261,6 +272,11 @@ def main():
     print(f"  noisy dir : {args.noisy_dir}")
     print(f"  clean dir : {args.clean_dir or '(none)'}")
     print(f"  jobs      : {len(jobs)} new")
+    if args.pretrained is not None:
+        if not args.pretrained.exists():
+            sys.exit(f"--pretrained file not found: {args.pretrained}")
+        print(f"  pretrained: {args.pretrained}  "
+              f"(loaded into init_state_dict for supported algos)")
     print(f"  configs   :")
     seen = set()
     for a, cp in cfg_pairs:
@@ -334,6 +350,7 @@ def main():
                 save_checkpoint=not args.no_checkpoint,
                 save_figures=not args.no_figures,
                 verbose=True,
+                pretrained_path=args.pretrained,
             )
             if summary.get("status") == "success":
                 successes += 1

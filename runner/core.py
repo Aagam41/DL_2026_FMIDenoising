@@ -56,6 +56,7 @@ def run_one(
     save_figures: bool = True,
     gpu_sample_interval: float = 2.0,
     verbose: bool = True,
+    pretrained_path: Optional[Path] = None,
 ):
     """
     Run a single (algo, noisy_path) job. Returns a summary dict.
@@ -71,6 +72,16 @@ def run_one(
                      the config .py file, e.g. "dvt_unet3d_t4"). Stored
                      in runs.csv so you can later filter results by
                      config name when collating data across groups.
+        pretrained_path: Optional path to a pretrained checkpoint. If
+                     given AND the algo's train_self_supervised accepts
+                     an `init_state_dict` parameter, the model is
+                     initialized from this checkpoint before training.
+                     Combined with a config that has 0 training iters
+                     (warmup_iters=0, n2v_iters=0), this gives a pure
+                     "load + infer" pass. Combined with a short-schedule
+                     config, this gives a fine-tune pass. Algos without
+                     init_state_dict support log a warning and proceed
+                     with from-scratch training.
 
     Side effects (all paths group-scoped):
         - One row added to <results_dir>/<group_id>/runs.csv
@@ -196,14 +207,47 @@ def run_one(
             except KeyError as e:
                 raise ValueError(f"Bad temporal_target '{temp_name}': {e}")
 
+        # ── Load pretrained init (optional) ───────────────────
+        # Build train_kwargs dict; only add init_state_dict if the algo
+        # accepts it (currently dvt_unet3d, restormer3d).
+        train_kwargs = dict(
+            stack=noisy, device=device, config=eff_config, verbose=verbose,
+        )
+        pretrained_state = None
+        if pretrained_path is not None:
+            import inspect
+            sig = inspect.signature(mod.train_self_supervised)
+            if "init_state_dict" not in sig.parameters:
+                print(f"   WARNING: algo '{algo}' does not support "
+                      f"init_state_dict; --pretrained ignored, "
+                      f"training from scratch.")
+            else:
+                try:
+                    if verbose:
+                        print(f"   Loading pretrained init from "
+                              f"{pretrained_path}…")
+                    pre_model, _ = mod.load_checkpoint(
+                        str(pretrained_path), device=device,
+                    )
+                    pretrained_state = pre_model.state_dict()
+                    del pre_model
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    train_kwargs["init_state_dict"] = pretrained_state
+                    # Record in config snapshot so it lands in config.csv
+                    eff_config["__pretrained_path"] = str(pretrained_path)
+                except Exception as e:
+                    print(f"   WARNING: failed to load pretrained from "
+                          f"{pretrained_path}: {e}. Falling back to "
+                          f"from-scratch training.")
+
         # ── Training ──────────────────────────────────────────
         if verbose:
             print(f"   Training on {device}…")
         with timer.stage("train"):
-            model, returned_cfg = mod.train_self_supervised(
-                stack=noisy, device=device, config=eff_config,
-                verbose=verbose,
-            )
+            model, returned_cfg = mod.train_self_supervised(**train_kwargs)
 
         # ── Inference ─────────────────────────────────────────
         if verbose:

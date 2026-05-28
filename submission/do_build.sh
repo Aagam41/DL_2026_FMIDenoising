@@ -23,8 +23,7 @@ SUBMISSION_ALGO="${1:-$DEFAULT_ALGO}"
 SUBMISSION_CONFIG="${2:-$DEFAULT_CONFIG}"
 
 # Tag = algo-config, lowercased and sanitized for Docker
-TAG_SUFFIX=$(echo "${SUBMISSION_ALGO}-${SUBMISSION_CONFIG}" \
-             | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')
+TAG_SUFFIX=$(echo "${SUBMISSION_ALGO}-${SUBMISSION_CONFIG}" | tr '[:upper:]' '[:lower:]')
 DOCKER_IMAGE_TAG="cidc25-submission-${TAG_SUFFIX}"
 
 echo "=+= Build args:"
