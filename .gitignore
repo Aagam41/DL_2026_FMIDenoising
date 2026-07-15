@@ -12,3 +12,5 @@
 /paper/
 /submission/
 /pretrained/
+
+__pycache__/

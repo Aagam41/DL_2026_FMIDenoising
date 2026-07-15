@@ -1,0 +1,112 @@
+Evaluation
+Evaluation ID
+8765afe0-5b8d-4728-9849-6efc5a099e1e
+Submission ID
+ec413612-4ea3-405e-a8d0-c7a63a713bc2
+Method ID
+46ed2ef8-5ac6-47fa-aec4-7f5878630917
+Status
+Succeeded
+User
+User Mugshot aagamsheth 
+Challenge
+AI4LIFE-CIDC25
+Phase
+Final Submission Phase: Noise Level Generalization
+Algorithm
+Restormer3D (Image Version a3fbdb8d-667d-4fc4-b615-c458bbe1942d Model version d8d6e0c7-7a84-4f92-9624-6741937504e7 )
+Submission created
+May 27, 2026, 4:28 p.m.
+Result created
+May 27, 2026, 4:28 p.m.
+Position on leaderboard
+1
+Publication:
+Comment:
+Restormer3D-N2V-50k-PT
+Metrics
+{
+  "results": [
+    {
+      "sSNR": 17.175874710083008,
+      "tSNR": 18.190844809927967,
+      "sPSNR": 19.787421269356884,
+      "stSNR": 17.683359760005487,
+      "tPSNR": 22.334945105315178,
+      "stPSNR": 21.06118318733603,
+      "sSI_PSNR": 58.86712942540223,
+      "sSNR_std": 0.3069712221622467,
+      "tSI_PSNR": 50.22849900007103,
+      "tSNR_std": 2.903147699011559,
+      "sPSNR_std": 0.3655658375186061,
+      "stSI_PSNR": 54.54781421273663,
+      "tPSNR_std": 4.089799429233826,
+      "sSI_PSNR_std": 0.48177010856365005,
+      "tSI_PSNR_std": 1.6173300298556441
+    },
+    {
+      "sSNR": 17.65084457397461,
+      "tSNR": 18.45229993321118,
+      "sPSNR": 19.76601356051141,
+      "stSNR": 18.051572253592894,
+      "tPSNR": 21.654380278584867,
+      "stPSNR": 20.71019691954814,
+      "sSI_PSNR": 56.45373867044658,
+      "sSNR_std": 0.3176284730434418,
+      "tSI_PSNR": 48.98308336487949,
+      "tSNR_std": 2.9516661546097596,
+      "sPSNR_std": 0.39350395587260517,
+      "stSI_PSNR": 52.71841101766304,
+      "tPSNR_std": 3.4963192832292886,
+      "sSI_PSNR_std": 0.3935698772444822,
+      "tSI_PSNR_std": 1.322344350263823
+    },
+    {
+      "sSNR": 18.29831886291504,
+      "tSNR": 19.108122570833075,
+      "sPSNR": 19.92530960841607,
+      "stSNR": 18.703220716874057,
+      "tPSNR": 21.619089101892712,
+      "stPSNR": 20.77219935515439,
+      "sSI_PSNR": 58.69946026338854,
+      "sSNR_std": 0.36375582218170166,
+      "tSI_PSNR": 51.44969690034942,
+      "tSNR_std": 2.8143740742775925,
+      "sPSNR_std": 0.4337274329978859,
+      "stSI_PSNR": 55.07457858186898,
+      "tPSNR_std": 3.3749394646581448,
+      "sSI_PSNR_std": 0.4014517021972969,
+      "tSI_PSNR_std": 1.6861647350423643
+    },
+    {
+      "sSNR": 17.452232360839844,
+      "tSNR": 18.27548042825947,
+      "sPSNR": 19.233033102050367,
+      "stSNR": 17.863856394549657,
+      "tPSNR": 21.434989281846757,
+      "stPSNR": 20.334011191948562,
+      "sSI_PSNR": 58.16098477263785,
+      "sSNR_std": 0.4159504175186157,
+      "tSI_PSNR": 50.243580219906775,
+      "tSNR_std": 2.8310583791487547,
+      "sPSNR_std": 0.9415671345511637,
+      "stSI_PSNR": 54.20228249627232,
+      "tPSNR_std": 3.4601651153227,
+      "sSI_PSNR_std": 2.441621463001598,
+      "tSI_PSNR_std": 1.9168949583312143
+    }
+  ],
+  "aggregates": {
+    "sSNR": 17.644317626953125,
+    "tSNR": 18.506686935557923,
+    "sPSNR": 19.677944385083684,
+    "score": 18.075502281255524,
+    "stSNR": 18.075502281255524,
+    "tPSNR": 21.76085094190988,
+    "stPSNR": 20.71939766349678,
+    "sSI_PSNR": 58.0453282829688,
+    "tSI_PSNR": 50.22621487130168,
+    "stSI_PSNR": 54.13577157713524
+  }
+}
+

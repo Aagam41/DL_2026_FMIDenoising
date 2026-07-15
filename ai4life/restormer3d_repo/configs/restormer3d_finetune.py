@@ -31,7 +31,7 @@ CONFIG = {
 
     # ── Backbone — MUST match restormer3d_pretrain.py ────────────
     "dim":                   32,
-    "num_blocks":            (1, 1, 1, 2),
+    "num_blocks":            (2, 2, 2, 3),
     "num_refinement_blocks": 2,
     "heads":                 (1, 2, 4, 8),
     "ffn_expansion_factor":  2.0,
@@ -46,15 +46,15 @@ CONFIG = {
     # No warmup — pretrained model already understands the data distribution
     # so warmup against temporal median is redundant.
     "warmup_iters": 0,
-    "n2v_iters":    4000,
+    "n2v_iters":    800,
     # Lower LR than scratch — standard 5-10× reduction for fine-tuning
-    "lr":            0.0009883029120086638,
+    "lr":           1e-4,
 
     # ── Noise2Void mask — same as pretrain ───────────────────────
-    "mask_ratio": 0.027043927794832567,
-    "mask_radius": 2,
+    "mask_ratio":   0.015,
+    "mask_radius":  1,
 
     # ── Preprocessing — MUST match restormer3d_pretrain.py ───────
-    "normalization": "p3_p97",
+    "normalization":   "p0.5_p99.5",
     "temporal_target": "temporal_median_2d",
 }

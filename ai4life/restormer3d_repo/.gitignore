@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pth
+*.tar.gz
+.last_built_*
+benchmark_results/*
+!benchmark_results/.gitkeep
+pretrained_restormer3d/*
+!pretrained_restormer3d/.gitkeep
+submission/model/*.pth
+submission/test/input/interf0/images/stacked-neuron-images-with-noise/*.tif
+submission/test/output/interf0/**
+!submission/**/.gitkeep
